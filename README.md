@@ -4,15 +4,15 @@
 
 - Provide a list of prompts. Completions are not needed, but these prompts should come from actual use cases of your desired downstream task.
 
-- Embeddings are created for each of the prompts. Then a collection is created of the most-DISsimilar-prompts to the average of the then-current collection, to create an even fence around the latent space of the possible prompts.
+- Embeddings are created for each of the prompts. Then a collection is created of the most-**co**sine-DISsimilar-prompts to the average of the then-current collection, to create an even fence around the latent space of the possible prompts.
 
-- The collection will grow up to a target number of samples (which, naturally, should be drastically fewer than the number of total prompts), _or_ up to a select **co**sine similarity value which acts as a tripwire; when getting the next most-dissimilar-from-group prompt, if the cosine similarity is above this tripwire, no more are added and the collection is complete.
+- The collection will grow up to a target number of samples (which, naturally, should be drastically fewer than the number of total prompts), _or_ up to a select cosine similarity value which acts as a tripwire; when getting the next most-dissimilar-from-group prompt, if the cosine similarity is above this tripwire, no more are added and the collection is complete.
 
 - Then, best-of-the-best LLM responses will be generated against those inputs, through multi-model sampling followed by a multi-model judgement phase where the outputs are source-blind **sort**ed according to each judgement model's preference, then scored in aggregate.
 
 - The final result is a highest-possible-quality data set of `prompt -> completion` pairs, across the most diverse possible prompts for your downstream task.
 
-- Also, this **consortium** style inference could be used as a traditional inference client/sdk as well. Naturally, this will be categorically slower - and expensive - but that may be fine for some use cases!
+- Also, this **consortium**-style inference could be used as a traditional inference client/sdk as well. Naturally, this will be categorically slower - and expensive - but that may be fine for some use cases!
 
 # Goals & Intents
 
