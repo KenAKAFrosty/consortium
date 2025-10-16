@@ -1,5 +1,6 @@
 [package]
 name = "consortium"
+description = "Evergreen best-of-best LLM generations at your fingertips"
 version = "0.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"

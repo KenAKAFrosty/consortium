@@ -1,6 +1,6 @@
 # Consortium
 
-### Best-of-the-best LLM generations at your fingertips
+### Evergreen best-of-best LLM generations at your fingertips
 
 - Provide a list of prompts. Completions are not needed, but these prompts should come from actual use cases of your desired downstream task.
 
