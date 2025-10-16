@@ -1,0 +1,11 @@
+[package]
+name = "consortium"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/KenAKAFrosty/consortium"
+keywords = ["AI", "LLM", "training-data", "fine-tune"]
+categories = ["template-engine", "api-bindings", "text-processing"]
+
+[dependencies]
