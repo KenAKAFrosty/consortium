@@ -16,7 +16,7 @@ Date: 2026-05-15
 
 Secondary use case: the same machinery doubles as a "consortium" inference SDK for runtime calls (slower, costlier, higher quality). The crate also incidentally yields a normalized set of provider clients.
 
-Provider modules: Claude / OpenAI / Gemini are real (M2a/b/c landed); Deepseek / Kimi / Qwen / Llama remain stubs commented out of `multi_infer` until M7. M0 added the dependency baseline (`tokio` full, `futures`, `reqwest` rustls-tls + json, `serde` derive, `serde_json`, `thiserror`, `bytes`; dev-deps `tokio-test`, `mockito`) and moved agnostic output types to owned payloads. M1 landed the async fan-out: `multi_infer` is `pub async fn(&MultiAiCompletionInputs<'_>) -> Vec<ProviderAttempt>` with typed `AgnosticCompletionError`, `ProviderKind`, and a local retry helper; each `ProviderAttempt` carries `input_index` so callers can correlate results back to specific input slots even when the same provider repeats. The public construction path is `MultiAiCompletionInputs::new(&[AiCompletionInputs::…])`, with active provider client / command / model / message / role types re-exported at the crate root. M2 landed real clients for all three target providers: each provider's `*Client` (with `new` / `from_env` / `with_base_url`), typed `*Model` enum, `*CompletionCommand`, mockito-tested wire path, and per-provider failure mapping into `AgnosticCompletionError`. The `AgnosticCompletionError::ProviderStub` variant is now unreachable in `multi_infer` and is slated for removal in the extraction-checkpoint pass after M2c. The boundary the next phase picks up at is M3 (embeddings + diversification).
+Provider modules: Claude / OpenAI / Gemini are real (M2a/b/c landed); Deepseek / Kimi / Qwen / Llama remain stubs commented out of `multi_infer` until M7. M0 added the dependency baseline (`tokio` full, `futures`, `reqwest` rustls-tls + json, `serde` derive, `serde_json`, `thiserror`, `bytes`; dev-deps `tokio-test`, `mockito`) and moved agnostic output types to owned payloads. M1 landed the async fan-out: `multi_infer` is `pub async fn(&MultiAiCompletionInputs<'_>) -> Vec<ProviderAttempt>` with typed `AgnosticCompletionError`, `ProviderKind`, and a local retry helper; each `ProviderAttempt` carries `input_index` so callers can correlate results back to specific input slots even when the same provider repeats. The public construction path is `MultiAiCompletionInputs::new(&[AiCompletionInputs::…])`, with active provider client / command / model / message / role types re-exported at the crate root. M2 landed real clients for all three target providers: each provider's `*Client` (with `new` / `from_env` / `with_base_url`), typed `*Model` enum, `*CompletionCommand`, mockito-tested wire path, and per-provider failure mapping into `AgnosticCompletionError`. The post-M2c extraction-checkpoint pass lifted `parse_retry_after`, the shared `WireErrorBody`, and the 401/403/429/4xx/5xx status-to-failure mapping into `src/ai_client_apis/shared.rs` via a small `FailureFromStatus` trait that each provider impls in four trivial methods. `AgnosticCompletionError::ProviderStub` was retired in that same commit. The boundary the next phase picks up at is M3 (embeddings + diversification).
 
 **Decisions locked in via Q&A + plan review:**
 - Initial provider depth: Claude, OpenAI, Gemini only. Deepseek/Kimi/Qwen/Llama stay as stubs until M7.
@@ -43,21 +43,21 @@ Status: landed.
 
 - `multi_infer` is `pub async fn` returning `Vec<ProviderAttempt>`. The library does not own a Tokio runtime; callers provide one (`#[tokio::test]`, `#[tokio::main]`, or a manually-built runtime).
 - `ProviderKind { Claude, OpenAi, Gemini }` names the three M2-tier providers. Deepseek/Kimi/Qwen/Llama remain stubs through M7.
-- `AgnosticCompletionError` (thiserror), every variant carrying `provider: ProviderKind`:
+- `AgnosticCompletionError` (thiserror), every variant carrying `provider: ProviderKind`. Current contract (after M2 refinements and the post-M2c extraction pass):
   - `Transport { source: reqwest::Error }`
   - `Deserialize { source: serde_json::Error }`
-  - `RateLimited { retry_after: Option<Duration> }`
-  - `Auth`
+  - `RateLimited { retry_after: Option<Duration>, message: Option<String> }`
+  - `Auth { message: Option<String> }`
   - `InvalidRequest { message: String }`
   - `ServerError { status: u16, message: Option<String> }`
-  - `ProviderStub` — temporary M1 placeholder for unimplemented providers; retires when M2 lands.
+  - `MalformedResponse { reason: String }`
 
-  Accessors: `provider()` and `is_transient()`. Transient = Transport / RateLimited / ServerError.
-- `ProviderAttempt { provider, result, retries, latency }` with `result: Result<AgnosticCompletionOutput, AgnosticCompletionError>`. Per-provider failures stay inside `result` — never collapsed to a top-level fan-out error.
+  Accessors: `provider()` and `is_transient()`. Transient = Transport / RateLimited / ServerError. (M1 introduced the variant set originally; M2 added `Auth.message`, `RateLimited.message`, and `MalformedResponse`. The M1-era `ProviderStub` placeholder was retired in the extraction-checkpoint commit once all three real providers were live.)
+- `ProviderAttempt { provider, result, retries, latency, input_index }` with `result: Result<AgnosticCompletionOutput, AgnosticCompletionError>`. Per-provider failures stay inside `result` — never collapsed to a top-level fan-out error. `input_index` (added post-M1) lets callers correlate completion-order attempts back to original input slots.
 - Fan-out is `FuturesUnordered<BoxFuture<'a, ProviderAttempt>>` across Claude/OpenAI/Gemini so the three concrete branch futures share one in-flight queue.
 - `run_with_retry` is local and concrete (not generic over error type). Exponential backoff with bounded jitter, honors `RateLimited::retry_after` when set. Defaults: `DEFAULT_MAX_ATTEMPTS = 3`, `DEFAULT_BASE_DELAY = 100ms`. Expected to be replaced by `backon` once the project standardizes per `CONTRIBUTING.md`.
-- `convert_raw_result_to_agnostic_output` is crate-private and returns `Result<AgnosticCompletionOutput, AgnosticCompletionError>`. Its Ok-arm bodies are still empty stubs per provider — M2 fills them in with real conversions.
-- **Verified:** `multi_infer_returns_one_attempt_per_input_with_failures_preserved` (`#[tokio::test]`) constructs three stub inputs (Gemini / OpenAI / Claude) and asserts each produces exactly one `ProviderAttempt` carrying the matching provider id and a typed `ProviderStub` error, with `retries == 0`.
+- `convert_raw_result_to_agnostic_output` is crate-private and returns `Result<AgnosticCompletionOutput, AgnosticCompletionError>`. M2 filled in real per-provider Ok arms (text chunks + token counts); the seed-era empty-vec stubs are gone.
+- **Verified during M1 (pre-extraction tests since superseded by M2 fan-out tests):** an `#[tokio::test]` constructed three stub inputs and asserted each produced exactly one `ProviderAttempt` with the matching provider id and a typed error. After M2c retired all stubs, that test was replaced by the M2-era fan-out success / duplicate-index / transient-retry tests in `src/lib.rs#tests`.
 
 ### M2 — Three Real Provider Clients
 
@@ -100,14 +100,16 @@ Sequenced as one provider at a time, validating the shape on the first before re
 - `GeminiCompletionFailure` typed enum (same variant list as OpenAI / Claude). Converted via `gemini_failure_to_agnostic`.
 - Tests: success / multi-text-part concatenation / 401 / 429-with-`Retry-After` / 400 / 503 / malformed-JSON / empty-candidates-`MalformedResponse` / empty-text-parts-`MalformedResponse` / model-serialization / `multi_infer` fan-out success. Plus 1 `#[ignore]` live test on `GEMINI_API_KEY`.
 
-**Extraction checkpoint (post-M2c, pending).** All three providers now share the same surface shape with diverging wire semantics. Specific candidates the extraction pass should evaluate:
+**Extraction checkpoint: landed.** Shared utilities moved into `src/ai_client_apis/shared.rs` (`pub(crate)`):
 
-- `parse_retry_after` — byte-identical across OpenAI / Claude / Gemini. Cleanest extraction candidate.
-- `map_failure_from_status` — same 401/403 → Auth, 429 → RateLimited, 4xx → InvalidRequest, 5xx → ServerError mapping in all three. Differs only in the failure enum it produces. Lifts as a small generic helper that takes a constructor function per category, or as a `trait ProviderFailureBuilder` if we want named methods. Pick the smaller of the two.
-- `WireErrorBody { error: { message } }` — OpenAI, Anthropic, and Google all share this shape (Google's body also carries `code` / `status` fields but `message` is what we need). Lift cleanly.
-- Retire `AgnosticCompletionError::ProviderStub` — now unreachable in `multi_infer`. Drop the variant from `provider()` / `is_transient()` and update any compile errors.
+- `parse_retry_after(&HeaderMap) -> Option<Duration>` — one definition, used by all three providers.
+- `WireErrorBody { error: { message } }` — one definition, plus `parse_error_message(&Bytes) -> Option<String>` wrapping the parse.
+- `FailureFromStatus` trait with four constructor methods (`auth`, `rate_limited`, `invalid_request`, `server_error`) and `map_status_to_failure<F: FailureFromStatus>(status, headers, bytes) -> F` doing the 401/403 → Auth, 429 → RateLimited (with `parse_retry_after`), 400..=499 → InvalidRequest, 500..=599 → ServerError, fallback → ServerError mapping. Each provider impls the trait in four trivial methods and the call site becomes a single `super::shared::map_status_to_failure(...)` line.
+- `AgnosticCompletionError::ProviderStub` retired. `provider()` and `is_transient()` exhaustive matches updated.
 
-Per the seed-first constraint, no helpers were extracted during M2c itself. The extraction is its own scoped slice with no provider behavior changes.
+Per-provider `*CompletionFailure` enums were kept as-is — the extraction was a pure refactor with no semantic redesign. Collapsing to a shared `ProviderFailure` enum was considered and deferred since it'd be a behavior-shape change, not a refactor.
+
+Provider behavior, public API surface, and wire shape did not change. Test matrix stayed green at 34 passed + 3 ignored.
 
 - **Verify per provider:** `mockito` parsing tests covering success, each typed failure variant, and the `MalformedResponse` empty-content edge; `#[ignore]`-gated integration tests that hit real APIs when keys are present (`cargo test -- --ignored`).
 

@@ -102,8 +102,6 @@ pub enum AgnosticCompletionError {
         provider: ProviderKind,
         reason: String,
     },
-    #[error("{provider:?}: stub provider has no real client yet")]
-    ProviderStub { provider: ProviderKind },
 }
 
 impl AgnosticCompletionError {
@@ -115,8 +113,7 @@ impl AgnosticCompletionError {
             | Self::Auth { provider, .. }
             | Self::InvalidRequest { provider, .. }
             | Self::ServerError { provider, .. }
-            | Self::MalformedResponse { provider, .. }
-            | Self::ProviderStub { provider } => *provider,
+            | Self::MalformedResponse { provider, .. } => *provider,
         }
     }
 
@@ -126,8 +123,7 @@ impl AgnosticCompletionError {
             Self::Deserialize { .. }
             | Self::Auth { .. }
             | Self::InvalidRequest { .. }
-            | Self::MalformedResponse { .. }
-            | Self::ProviderStub { .. } => false,
+            | Self::MalformedResponse { .. } => false,
         }
     }
 }

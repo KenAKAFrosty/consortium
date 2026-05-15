@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-use bytes::Bytes;
-use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -148,6 +146,24 @@ pub enum ClaudeCompletionFailure {
     MalformedResponse { reason: String },
 }
 
+impl super::shared::FailureFromStatus for ClaudeCompletionFailure {
+    fn auth(message: Option<String>) -> Self {
+        Self::Auth { message }
+    }
+    fn rate_limited(retry_after: Option<Duration>, message: Option<String>) -> Self {
+        Self::RateLimited {
+            retry_after,
+            message,
+        }
+    }
+    fn invalid_request(message: String) -> Self {
+        Self::InvalidRequest { message }
+    }
+    fn server_error(status: u16, message: Option<String>) -> Self {
+        Self::ServerError { status, message }
+    }
+}
+
 pub type ClaudeResult = Result<ClaudeCompletionSuccess, ClaudeCompletionFailure>;
 
 #[derive(Serialize)]
@@ -188,16 +204,6 @@ enum WireContentBlock {
 struct WireUsage {
     input_tokens: u64,
     output_tokens: u64,
-}
-
-#[derive(Deserialize)]
-struct WireErrorBody {
-    error: WireErrorPayload,
-}
-
-#[derive(Deserialize)]
-struct WireErrorPayload {
-    message: String,
 }
 
 pub async fn claude_get_completion(
@@ -261,38 +267,12 @@ pub async fn claude_get_completion(
             output_tokens: parsed.usage.output_tokens,
         })
     } else {
-        Err(map_failure_from_status(status.as_u16(), &headers, &bytes))
+        Err(super::shared::map_status_to_failure(
+            status.as_u16(),
+            &headers,
+            &bytes,
+        ))
     }
-}
-
-fn map_failure_from_status(
-    status: u16,
-    headers: &HeaderMap,
-    bytes: &Bytes,
-) -> ClaudeCompletionFailure {
-    let message = serde_json::from_slice::<WireErrorBody>(bytes)
-        .ok()
-        .map(|b| b.error.message);
-
-    match status {
-        401 | 403 => ClaudeCompletionFailure::Auth { message },
-        429 => ClaudeCompletionFailure::RateLimited {
-            retry_after: parse_retry_after(headers),
-            message,
-        },
-        400..=499 => ClaudeCompletionFailure::InvalidRequest {
-            message: message.unwrap_or_else(|| format!("HTTP {status}")),
-        },
-        500..=599 => ClaudeCompletionFailure::ServerError { status, message },
-        // 1xx/3xx or any other non-success status surfaces as a typed ServerError so the
-        // caller still gets a concrete status code instead of a silent collapse.
-        _ => ClaudeCompletionFailure::ServerError { status, message },
-    }
-}
-
-fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let raw = headers.get(RETRY_AFTER)?.to_str().ok()?;
-    raw.parse::<u64>().ok().map(Duration::from_secs)
 }
 
 #[cfg(test)]
@@ -469,21 +449,15 @@ mod tests {
         let err = claude_get_completion(&client, &sample_command())
             .await
             .expect_err("expected server-class failure");
-        // Anthropic uses 529 for "overloaded" — it falls into the 4xx-range InvalidRequest
-        // arm in our mapping. Both ServerError and InvalidRequest are acceptable typed
-        // surfaces here; we check that we did not silently succeed and that the message
-        // came through.
+        // Anthropic uses 529 for "overloaded". 529 falls in the 500..=599 arm of the
+        // shared status mapping, so it surfaces as ServerError with the original status
+        // preserved on the typed payload.
         match err {
-            ClaudeCompletionFailure::InvalidRequest { message } => {
-                assert_eq!(message, "overloaded");
-            }
-            ClaudeCompletionFailure::ServerError {
-                status, message, ..
-            } => {
+            ClaudeCompletionFailure::ServerError { status, message } => {
                 assert_eq!(status, 529);
                 assert_eq!(message.as_deref(), Some("overloaded"));
             }
-            other => panic!("expected typed failure, got {other:?}"),
+            other => panic!("expected ServerError, got {other:?}"),
         }
     }
 

@@ -5,3 +5,4 @@ pub mod kimik2;
 pub mod llama;
 pub mod openai;
 pub mod qwen;
+pub(crate) mod shared;

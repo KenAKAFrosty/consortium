@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-use bytes::Bytes;
-use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
@@ -146,6 +144,24 @@ pub enum GeminiCompletionFailure {
     MalformedResponse { reason: String },
 }
 
+impl super::shared::FailureFromStatus for GeminiCompletionFailure {
+    fn auth(message: Option<String>) -> Self {
+        Self::Auth { message }
+    }
+    fn rate_limited(retry_after: Option<Duration>, message: Option<String>) -> Self {
+        Self::RateLimited {
+            retry_after,
+            message,
+        }
+    }
+    fn invalid_request(message: String) -> Self {
+        Self::InvalidRequest { message }
+    }
+    fn server_error(status: u16, message: Option<String>) -> Self {
+        Self::ServerError { status, message }
+    }
+}
+
 pub type GeminiResult = Result<GeminiCompletionSuccess, GeminiCompletionFailure>;
 
 #[derive(Serialize)]
@@ -212,16 +228,6 @@ struct WireUsageMetadata {
     prompt_token_count: u64,
     #[serde(rename = "candidatesTokenCount", default)]
     candidates_token_count: u64,
-}
-
-#[derive(Deserialize)]
-struct WireErrorBody {
-    error: WireErrorPayload,
-}
-
-#[derive(Deserialize)]
-struct WireErrorPayload {
-    message: String,
 }
 
 pub async fn gemini_get_completion(
@@ -311,38 +317,12 @@ pub async fn gemini_get_completion(
             output_tokens: parsed.usage_metadata.candidates_token_count,
         })
     } else {
-        Err(map_failure_from_status(status.as_u16(), &headers, &bytes))
+        Err(super::shared::map_status_to_failure(
+            status.as_u16(),
+            &headers,
+            &bytes,
+        ))
     }
-}
-
-fn map_failure_from_status(
-    status: u16,
-    headers: &HeaderMap,
-    bytes: &Bytes,
-) -> GeminiCompletionFailure {
-    let message = serde_json::from_slice::<WireErrorBody>(bytes)
-        .ok()
-        .map(|b| b.error.message);
-
-    match status {
-        401 | 403 => GeminiCompletionFailure::Auth { message },
-        429 => GeminiCompletionFailure::RateLimited {
-            retry_after: parse_retry_after(headers),
-            message,
-        },
-        400..=499 => GeminiCompletionFailure::InvalidRequest {
-            message: message.unwrap_or_else(|| format!("HTTP {status}")),
-        },
-        500..=599 => GeminiCompletionFailure::ServerError { status, message },
-        // 1xx/3xx or any other non-success status surfaces as a typed ServerError so the
-        // caller still gets a concrete status code instead of a silent collapse.
-        _ => GeminiCompletionFailure::ServerError { status, message },
-    }
-}
-
-fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let raw = headers.get(RETRY_AFTER)?.to_str().ok()?;
-    raw.parse::<u64>().ok().map(Duration::from_secs)
 }
 
 #[cfg(test)]

@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-use bytes::Bytes;
-use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
@@ -150,6 +148,24 @@ pub enum OpenAiCompletionFailure {
     MalformedResponse { reason: String },
 }
 
+impl super::shared::FailureFromStatus for OpenAiCompletionFailure {
+    fn auth(message: Option<String>) -> Self {
+        Self::Auth { message }
+    }
+    fn rate_limited(retry_after: Option<Duration>, message: Option<String>) -> Self {
+        Self::RateLimited {
+            retry_after,
+            message,
+        }
+    }
+    fn invalid_request(message: String) -> Self {
+        Self::InvalidRequest { message }
+    }
+    fn server_error(status: u16, message: Option<String>) -> Self {
+        Self::ServerError { status, message }
+    }
+}
+
 pub type OpenAiResult = Result<OpenAiCompletionSuccess, OpenAiCompletionFailure>;
 
 #[derive(Serialize)]
@@ -188,16 +204,6 @@ struct WireResponseMessage {
 struct WireUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
-}
-
-#[derive(Deserialize)]
-struct WireErrorBody {
-    error: WireErrorPayload,
-}
-
-#[derive(Deserialize)]
-struct WireErrorPayload {
-    message: String,
 }
 
 pub async fn openai_get_completion(
@@ -257,38 +263,12 @@ pub async fn openai_get_completion(
             completion_tokens: parsed.usage.completion_tokens,
         })
     } else {
-        Err(map_failure_from_status(status.as_u16(), &headers, &bytes))
+        Err(super::shared::map_status_to_failure(
+            status.as_u16(),
+            &headers,
+            &bytes,
+        ))
     }
-}
-
-fn map_failure_from_status(
-    status: u16,
-    headers: &HeaderMap,
-    bytes: &Bytes,
-) -> OpenAiCompletionFailure {
-    let message = serde_json::from_slice::<WireErrorBody>(bytes)
-        .ok()
-        .map(|b| b.error.message);
-
-    match status {
-        401 | 403 => OpenAiCompletionFailure::Auth { message },
-        429 => OpenAiCompletionFailure::RateLimited {
-            retry_after: parse_retry_after(headers),
-            message,
-        },
-        400..=499 => OpenAiCompletionFailure::InvalidRequest {
-            message: message.unwrap_or_else(|| format!("HTTP {status}")),
-        },
-        500..=599 => OpenAiCompletionFailure::ServerError { status, message },
-        // 1xx/3xx or any other non-success status surfaces as a typed ServerError so the
-        // caller still gets a concrete status code instead of a silent collapse.
-        _ => OpenAiCompletionFailure::ServerError { status, message },
-    }
-}
-
-fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let raw = headers.get(RETRY_AFTER)?.to_str().ok()?;
-    raw.parse::<u64>().ok().map(Duration::from_secs)
 }
 
 #[cfg(test)]
