@@ -38,12 +38,26 @@ The repo still contains stub `Client`, `CompletionCommand`, and `*_get_completio
 - Replace the borrowed/lifetime-parameterized agnostic output scaffolding in `src/lib.rs` with owned payload shapes before real provider work starts. The conceptual types stay, but `&str` / `&Vec<u8>` output fields should not survive into M2.
 
 ### M1 — Async Runtime + Error Types
-- Make the crate async-native: `multi_infer` becomes `async`, tests move to `#[tokio::test]`, and library code assumes a caller-managed Tokio runtime instead of constructing one internally.
-- Define `AgnosticCompletionError` with `thiserror` (transport, deserialize, rate-limit, auth, provider-specific variants).
-- Introduce a structured fan-out result, e.g. `ProviderAttempt { provider, result, retries, latency }`, so `multi_infer` preserves both successes and failures per provider instead of returning only successful outputs.
-- Replace the placeholder `let raw_results: Vec<…> = vec![]` in `multi_infer` (`src/lib.rs:118`) with a real `FuturesUnordered`-based fan-out.
-- Add a small retry helper (exponential backoff with jitter). Concrete, not generic.
-- **Verify:** the existing `multi_infer_placeholder_returns_empty_vec` test becomes async, drops the empty-vec assertion, and asserts that one `ProviderAttempt` is returned per input with no dropped attempts, even while stubs still error.
+
+Status: landed.
+
+- `multi_infer` is `pub async fn` returning `Vec<ProviderAttempt>`. The library does not own a Tokio runtime; callers provide one (`#[tokio::test]`, `#[tokio::main]`, or a manually-built runtime).
+- `ProviderKind { Claude, OpenAi, Gemini }` names the three M2-tier providers. Deepseek/Kimi/Qwen/Llama remain stubs through M7.
+- `AgnosticCompletionError` (thiserror), every variant carrying `provider: ProviderKind`:
+  - `Transport { source: reqwest::Error }`
+  - `Deserialize { source: serde_json::Error }`
+  - `RateLimited { retry_after: Option<Duration> }`
+  - `Auth`
+  - `InvalidRequest { message: String }`
+  - `ServerError { status: u16, message: Option<String> }`
+  - `ProviderStub` — temporary M1 placeholder for unimplemented providers; retires when M2 lands.
+
+  Accessors: `provider()` and `is_transient()`. Transient = Transport / RateLimited / ServerError.
+- `ProviderAttempt { provider, result, retries, latency }` with `result: Result<AgnosticCompletionOutput, AgnosticCompletionError>`. Per-provider failures stay inside `result` — never collapsed to a top-level fan-out error.
+- Fan-out is `FuturesUnordered<BoxFuture<'a, ProviderAttempt>>` across Claude/OpenAI/Gemini so the three concrete branch futures share one in-flight queue.
+- `run_with_retry` is local and concrete (not generic over error type). Exponential backoff with bounded jitter, honors `RateLimited::retry_after` when set. Defaults: `DEFAULT_MAX_ATTEMPTS = 3`, `DEFAULT_BASE_DELAY = 100ms`. Expected to be replaced by `backon` once the project standardizes per `CONTRIBUTING.md`.
+- `convert_raw_result_to_agnostic_output` is crate-private and returns `Result<AgnosticCompletionOutput, AgnosticCompletionError>`. Its Ok-arm bodies are still empty stubs per provider — M2 fills them in with real conversions.
+- **Verified:** `multi_infer_returns_one_attempt_per_input_with_failures_preserved` (`#[tokio::test]`) constructs three stub inputs (Gemini / OpenAI / Claude) and asserts each produces exactly one `ProviderAttempt` carrying the matching provider id and a typed `ProviderStub` error, with `retries == 0`.
 
 ### M2 — Three Real Provider Clients
 

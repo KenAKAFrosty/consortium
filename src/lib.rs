@@ -1,9 +1,15 @@
 mod ai_client_apis;
 
-use crate::ai_client_apis::{
-    claude::*, deepseek::*, gemini::*, kimik2::*, llama::*, openai::*, qwen::*,
-};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
+
+use crate::ai_client_apis::{claude::*, gemini::*, openai::*};
+
+#[derive(Clone, Copy)]
 enum AiCompletionInputs<'a> {
     Gemini(&'a GeminiClient, &'a GeminiCompletionCommand),
     OpenAi(&'a OpenAiClient, &'a OpenAiCompletionCommand),
@@ -27,6 +33,73 @@ enum RawAiCompletionResult {
     // Deepseek(DeepseekResult),
     // Qwen(QwenResult),
     // Llama(LlamaResult),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderKind {
+    Claude,
+    OpenAi,
+    Gemini,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgnosticCompletionError {
+    #[error("{provider:?}: transport failure: {source}")]
+    Transport {
+        provider: ProviderKind,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("{provider:?}: response deserialization failed: {source}")]
+    Deserialize {
+        provider: ProviderKind,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("{provider:?}: rate limited")]
+    RateLimited {
+        provider: ProviderKind,
+        retry_after: Option<Duration>,
+    },
+    #[error("{provider:?}: authentication failed")]
+    Auth { provider: ProviderKind },
+    #[error("{provider:?}: invalid request: {message}")]
+    InvalidRequest {
+        provider: ProviderKind,
+        message: String,
+    },
+    #[error("{provider:?}: server error (status {status})")]
+    ServerError {
+        provider: ProviderKind,
+        status: u16,
+        message: Option<String>,
+    },
+    #[error("{provider:?}: stub provider has no real client yet")]
+    ProviderStub { provider: ProviderKind },
+}
+
+impl AgnosticCompletionError {
+    pub fn provider(&self) -> ProviderKind {
+        match self {
+            Self::Transport { provider, .. }
+            | Self::Deserialize { provider, .. }
+            | Self::RateLimited { provider, .. }
+            | Self::Auth { provider }
+            | Self::InvalidRequest { provider, .. }
+            | Self::ServerError { provider, .. }
+            | Self::ProviderStub { provider } => *provider,
+        }
+    }
+
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Transport { .. } | Self::RateLimited { .. } | Self::ServerError { .. } => true,
+            Self::Deserialize { .. }
+            | Self::Auth { .. }
+            | Self::InvalidRequest { .. }
+            | Self::ProviderStub { .. } => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -53,99 +126,245 @@ pub struct AgnosticCompletionOutput {
     tokens_used: CompletionOutputTokensUsed,
 }
 
-pub fn convert_raw_result_to_agnostic_output(
+#[derive(Debug)]
+pub struct ProviderAttempt {
+    pub provider: ProviderKind,
+    pub result: Result<AgnosticCompletionOutput, AgnosticCompletionError>,
+    pub retries: u32,
+    pub latency: Duration,
+}
+
+fn convert_raw_result_to_agnostic_output(
     raw_result: RawAiCompletionResult,
-) -> AgnosticCompletionOutput {
+) -> Result<AgnosticCompletionOutput, AgnosticCompletionError> {
     match raw_result {
-        RawAiCompletionResult::OpenAi(result) => AgnosticCompletionOutput {
-            chunks: vec![],
-            tokens_used: CompletionOutputTokensUsed {
-                input: 0,
-                output: 0,
-            },
+        RawAiCompletionResult::OpenAi(result) => match result {
+            Ok(_success) => Ok(AgnosticCompletionOutput {
+                chunks: vec![],
+                tokens_used: CompletionOutputTokensUsed {
+                    input: 0,
+                    output: 0,
+                },
+            }),
+            Err(_failure) => Err(AgnosticCompletionError::ProviderStub {
+                provider: ProviderKind::OpenAi,
+            }),
         },
-        RawAiCompletionResult::Claude(result) => AgnosticCompletionOutput {
-            chunks: vec![],
-            tokens_used: CompletionOutputTokensUsed {
-                input: 0,
-                output: 0,
-            },
+        RawAiCompletionResult::Claude(result) => match result {
+            Ok(_success) => Ok(AgnosticCompletionOutput {
+                chunks: vec![],
+                tokens_used: CompletionOutputTokensUsed {
+                    input: 0,
+                    output: 0,
+                },
+            }),
+            Err(_failure) => Err(AgnosticCompletionError::ProviderStub {
+                provider: ProviderKind::Claude,
+            }),
         },
-        RawAiCompletionResult::Gemini(result) => AgnosticCompletionOutput {
-            chunks: vec![],
-            tokens_used: CompletionOutputTokensUsed {
-                input: 0,
-                output: 0,
-            },
+        RawAiCompletionResult::Gemini(result) => match result {
+            Ok(_success) => Ok(AgnosticCompletionOutput {
+                chunks: vec![],
+                tokens_used: CompletionOutputTokensUsed {
+                    input: 0,
+                    output: 0,
+                },
+            }),
+            Err(_failure) => Err(AgnosticCompletionError::ProviderStub {
+                provider: ProviderKind::Gemini,
+            }),
         },
     }
 }
 
-//this will all become async, but at time of writing was offline so could not add tokio etc)
-pub fn multi_infer(inputs: &MultiAiCompletionInputs) -> Vec<AgnosticCompletionOutput> {
-    println!("Running multi infer");
+const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+const DEFAULT_BASE_DELAY: Duration = Duration::from_millis(100);
 
-    //like here we could map into async functions and then run futures_unordered on them, etc.
-    let completion_async_funcs = inputs
-        .completion_inputs
-        .iter()
-        .map(async |input| match &input {
-            AiCompletionInputs::Claude(client, command) => {
-                RawAiCompletionResult::Claude(claude_get_completion(client, command).await)
+struct RetryOutcome {
+    result: Result<AgnosticCompletionOutput, AgnosticCompletionError>,
+    retries: u32,
+    latency: Duration,
+}
+
+async fn run_with_retry<F, Fut>(
+    max_attempts: u32,
+    base_delay: Duration,
+    mut operation: F,
+) -> RetryOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<AgnosticCompletionOutput, AgnosticCompletionError>>,
+{
+    let start = Instant::now();
+    let mut retries: u32 = 0;
+    loop {
+        match operation().await {
+            Ok(output) => {
+                return RetryOutcome {
+                    result: Ok(output),
+                    retries,
+                    latency: start.elapsed(),
+                };
             }
-            AiCompletionInputs::Gemini(client, command) => {
-                RawAiCompletionResult::Gemini(gemini_get_completion(client, command).await)
+            Err(err) => {
+                let can_retry = err.is_transient() && retries + 1 < max_attempts;
+                if !can_retry {
+                    return RetryOutcome {
+                        result: Err(err),
+                        retries,
+                        latency: start.elapsed(),
+                    };
+                }
+                let delay = delay_for_attempt(&err, retries, base_delay);
+                tokio::time::sleep(delay).await;
+                retries += 1;
             }
-            AiCompletionInputs::OpenAi(client, command) => {
-                RawAiCompletionResult::OpenAi(openai_get_completion(client, command).await)
-            } // AiCompletionInputs::Deepseek(client, command) => {
-              //     RawAiCompletionResult::Deepseek(deepseek_get_completion(client, command).await)
-              // }
-              // AiCompletionInputs::KimiK2(client, command) => {
-              //     RawAiCompletionResult::KimiK2(kimik2_get_completion(client, command).await)
-              // }
-              // AiCompletionInputs::Llama(client, command) => {
-              //     RawAiCompletionResult::Llama(llama_get_completion(client, command).await)
-              // }
-              // AiCompletionInputs::Qwen(client, command) => {
-              //     RawAiCompletionResult::Qwen(qwen_get_completion(client, command).await)
-              // }
-        });
+        }
+    }
+}
 
-    //once connected and can add futures crate, this is where we can do the futures_unordered thing. placeholder empty vec for now
-    let raw_results: Vec<RawAiCompletionResult> = vec![];
+fn delay_for_attempt(err: &AgnosticCompletionError, attempt: u32, base: Duration) -> Duration {
+    if let AgnosticCompletionError::RateLimited {
+        retry_after: Some(ra),
+        ..
+    } = err
+    {
+        return *ra;
+    }
+    let exp = attempt.min(6);
+    let backoff_ms = (base.as_millis() as u64).saturating_mul(1u64 << exp);
+    let jitter_ms = jitter_within(backoff_ms / 4);
+    Duration::from_millis(backoff_ms.saturating_add(jitter_ms))
+}
 
-    let agnostic_outputs: Vec<AgnosticCompletionOutput> = raw_results
-        .into_iter()
-        .map(|result| convert_raw_result_to_agnostic_output(result))
-        .collect();
+static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    // panic!("Not implemented");
+fn jitter_within(max_ms: u64) -> u64 {
+    if max_ms == 0 {
+        return 0;
+    }
+    let mut z = JITTER_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^= z >> 31;
+    z % (max_ms + 1)
+}
 
-    agnostic_outputs
+fn build_attempt<'a, F, Fut>(
+    provider: ProviderKind,
+    raw_op: F,
+) -> BoxFuture<'a, ProviderAttempt>
+where
+    F: FnMut() -> Fut + Send + 'a,
+    Fut: std::future::Future<Output = Result<AgnosticCompletionOutput, AgnosticCompletionError>>
+        + Send
+        + 'a,
+{
+    async move {
+        let outcome = run_with_retry(DEFAULT_MAX_ATTEMPTS, DEFAULT_BASE_DELAY, raw_op).await;
+        ProviderAttempt {
+            provider,
+            result: outcome.result,
+            retries: outcome.retries,
+            latency: outcome.latency,
+        }
+    }
+    .boxed()
+}
+
+pub async fn multi_infer<'a>(inputs: &'a MultiAiCompletionInputs<'a>) -> Vec<ProviderAttempt> {
+    let mut in_flight: FuturesUnordered<BoxFuture<'a, ProviderAttempt>> = FuturesUnordered::new();
+
+    for input in inputs.completion_inputs.iter().copied() {
+        let attempt_future = match input {
+            AiCompletionInputs::Claude(client, command) => build_attempt(
+                ProviderKind::Claude,
+                move || async move {
+                    let raw = claude_get_completion(client, command).await;
+                    convert_raw_result_to_agnostic_output(RawAiCompletionResult::Claude(raw))
+                },
+            ),
+            AiCompletionInputs::OpenAi(client, command) => build_attempt(
+                ProviderKind::OpenAi,
+                move || async move {
+                    let raw = openai_get_completion(client, command).await;
+                    convert_raw_result_to_agnostic_output(RawAiCompletionResult::OpenAi(raw))
+                },
+            ),
+            AiCompletionInputs::Gemini(client, command) => build_attempt(
+                ProviderKind::Gemini,
+                move || async move {
+                    let raw = gemini_get_completion(client, command).await;
+                    convert_raw_result_to_agnostic_output(RawAiCompletionResult::Gemini(raw))
+                },
+            ),
+        };
+        in_flight.push(attempt_future);
+    }
+
+    let mut attempts = Vec::with_capacity(inputs.completion_inputs.len());
+    while let Some(attempt) = in_flight.next().await {
+        attempts.push(attempt);
+    }
+    attempts
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use crate::{
-        AiCompletionInputs, MultiAiCompletionInputs,
+        AiCompletionInputs, MultiAiCompletionInputs, ProviderKind,
         ai_client_apis::{
+            claude::{ClaudeClient, ClaudeCompletionCommand},
             gemini::{GeminiClient, GeminiCompletionCommand},
             openai::{OpenAiClient, OpenAiCompletionCommand},
         },
     };
 
     use super::multi_infer;
-    #[test]
-    fn multi_infer_placeholder_returns_empty_vec() {
-        let commands = vec![
-            AiCompletionInputs::Gemini(&GeminiClient {}, &GeminiCompletionCommand {}),
-            AiCompletionInputs::OpenAi(&OpenAiClient {}, &OpenAiCompletionCommand {}),
+
+    #[tokio::test]
+    async fn multi_infer_returns_one_attempt_per_input_with_failures_preserved() {
+        let claude_client = ClaudeClient {};
+        let claude_command = ClaudeCompletionCommand {};
+        let openai_client = OpenAiClient {};
+        let openai_command = OpenAiCompletionCommand {};
+        let gemini_client = GeminiClient {};
+        let gemini_command = GeminiCompletionCommand {};
+
+        let inputs = vec![
+            AiCompletionInputs::Gemini(&gemini_client, &gemini_command),
+            AiCompletionInputs::OpenAi(&openai_client, &openai_command),
+            AiCompletionInputs::Claude(&claude_client, &claude_command),
         ];
-        let result = multi_infer(&MultiAiCompletionInputs {
-            completion_inputs: &commands,
-        });
-        assert!(result.is_empty());
+        let multi = MultiAiCompletionInputs {
+            completion_inputs: &inputs,
+        };
+
+        let attempts = multi_infer(&multi).await;
+
+        assert_eq!(
+            attempts.len(),
+            inputs.len(),
+            "every input should produce exactly one ProviderAttempt"
+        );
+
+        let providers: HashSet<ProviderKind> = attempts.iter().map(|a| a.provider).collect();
+        assert!(providers.contains(&ProviderKind::Claude));
+        assert!(providers.contains(&ProviderKind::OpenAi));
+        assert!(providers.contains(&ProviderKind::Gemini));
+
+        for attempt in &attempts {
+            let err = attempt
+                .result
+                .as_ref()
+                .expect_err("stub providers always Err in M1");
+            assert_eq!(err.provider(), attempt.provider);
+            assert_eq!(attempt.retries, 0, "ProviderStub is non-transient");
+        }
     }
 }
 
