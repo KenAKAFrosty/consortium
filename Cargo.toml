@@ -1,12 +1,12 @@
 [package]
 name = "consortium"
 description = "Evergreen best-of-best LLM generations at your fingertips"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/KenAKAFrosty/consortium"
-keywords = ["AI", "sdk", "LLM", "training-data", "fine-tune"]
+keywords = ["ai", "sdk", "llm", "training-data", "fine-tune"]
 categories = ["template-engine", "api-bindings", "text-processing"]
 
 [dependencies]
