@@ -34,4 +34,5 @@ Use it to capture meaningful directions, experiments, decisions, and course corr
 - [Current Implementation Plan](./plans/2026-05-15-implementation-plan.md)
 - [Initial Repo Read And Planning Journal](./journal/2026-05-15-initial-repo-read-and-planning.md)
 - [OpenAI Seed Shape For M2](./journal/2026-05-15-openai-seed-shape.md)
+- [Claude Seed And Typed Model Contract](./journal/2026-05-15-claude-seed-and-typed-models.md)
 - [Decision 0001: Owned Types At Async Boundaries](./decisions/0001-owned-types-at-async-boundaries.md)

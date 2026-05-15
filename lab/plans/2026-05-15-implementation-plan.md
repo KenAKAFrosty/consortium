@@ -63,21 +63,35 @@ Status: landed.
 
 Sequenced as one provider at a time, validating the shape on the first before replicating it. Each provider lives under `src/ai_client_apis/<name>/mod.rs` and follows the same contract.
 
-**M2a — OpenAI (seed): landed.** See [2026-05-15-openai-seed-shape](../journal/2026-05-15-openai-seed-shape.md) for the concrete client / command / failure / wire-type shape that Claude and Gemini should mirror. Key points:
+**Provider-wide conventions (landed during M2a/M2b).** Apply to every provider in M2 and beyond:
 
-- `OpenAiClient` holds a `reqwest::Client`, base URL (configurable for `mockito`), and `api_key`. Constructors: `new`, `from_env` (reads `OPENAI_API_KEY`), `with_base_url` (builder-style override).
-- `OpenAiCompletionCommand` carries model, optional system_prompt, messages, optional max_tokens, optional temperature; implements `Default`.
-- `OpenAiCompletionFailure` is a typed enum mirroring agnostic categories (Transport / Deserialize / Auth / RateLimited / InvalidRequest / ServerError) — provider-level typed errors are converted to `AgnosticCompletionError` via `openai_failure_to_agnostic` in `lib.rs`. `ProviderStub` retires for OpenAI but stays for Claude and Gemini.
-- `convert_raw_result_to_agnostic_output` OpenAI arm now populates a text chunk and real token counts.
-- Tests: 7 `mockito`-driven (success, 401, 403, 429 with `Retry-After`, 400, 503, malformed JSON) plus 1 `#[ignore]` live test gated on `OPENAI_API_KEY`; plus a `multi_infer` end-to-end mock that proves real text + tokens flow through the M1 fan-out contract.
+- Typed model enum (`OpenAiModel`, `ClaudeModel`, later `GeminiModel`) with `as_api_str`, `Display`, and `serde::Serialize`. `Custom(String)` variant for forward-compat. Public command structs must not expose raw model strings.
+- Per-provider `*CompletionFailure` enum with: `Transport(reqwest::Error)`, `Deserialize(serde_json::Error)`, `Auth { message: Option<String> }`, `RateLimited { retry_after: Option<Duration>, message: Option<String> }`, `InvalidRequest { message: String }`, `ServerError { status: u16, message: Option<String> }`, `MalformedResponse { reason: String }`.
+- 200-OK responses with missing/empty content blocks must surface as `MalformedResponse`, never empty-string success.
+- Agnostic `AgnosticCompletionError` carries the same shape including `Auth.message`, `RateLimited.message`, and a top-level `MalformedResponse { provider, reason }` variant.
 
-**M2b — Claude: pending.** Replicate the OpenAI shape: `ClaudeClient` with `from_env` (`ANTHROPIC_API_KEY`) + `with_base_url`, `ClaudeCompletionCommand`, `ClaudeCompletionFailure` enum, mockito tests, live test, `claude_failure_to_agnostic` in lib.rs, real conversion in `convert_raw_result_to_agnostic_output`.
+**M2a — OpenAI (seed): landed.** See [2026-05-15-openai-seed-shape](../journal/2026-05-15-openai-seed-shape.md) for the original shape and [2026-05-15-claude-seed-and-typed-models](../journal/2026-05-15-claude-seed-and-typed-models.md) for the contract refinements (typed model, MalformedResponse, message-context preservation) that landed with the Claude seed.
 
-**M2c — Gemini: pending.** Same shape, accounting for Gemini's different URL/auth scheme (`GOOGLE_API_KEY` / `GEMINI_API_KEY` query param, different request body).
+- `OpenAiClient` (`new` / `from_env` reading `OPENAI_API_KEY` / `with_base_url` builder).
+- `OpenAiCompletionCommand { model: OpenAiModel, system_prompt: Option<String>, messages, max_tokens: Option<u32>, temperature: Option<f32> }` with `Default`.
+- `OpenAiCompletionFailure` typed enum (full variant list above). Converted to `AgnosticCompletionError` via `openai_failure_to_agnostic` in `lib.rs`.
+- `convert_raw_result_to_agnostic_output` OpenAI arm populates a text chunk and real token counts.
+- Tests: success / 401 / 403 / 429-with-`Retry-After` / 400 / 503 / malformed-JSON / empty-choices-`MalformedResponse` / model-serialization / `multi_infer` fan-out success / `multi_infer` 503-driven retry verifying `ProviderAttempt.retries == 2`. Plus 1 `#[ignore]` live test on `OPENAI_API_KEY`.
 
-Cross-cutting: once two providers have landed, evaluate whether shared helpers (e.g., a generic `parse_retry_after`, a status-mapping helper, a common `ProviderFailure` shape) are worth extracting. Per the M2 seed constraint, do not extract until the second provider proves the same shape applies.
+**M2b — Claude: landed.**
 
-- **Verify per provider:** `mockito` parsing tests covering success and each typed failure variant; `#[ignore]`-gated integration tests that hit real APIs when keys are present (`cargo test -- --ignored`).
+- `ClaudeClient` (`new` / `from_env` reading `ANTHROPIC_API_KEY` / `with_base_url`). Auth via `x-api-key` header and required `anthropic-version: 2023-06-01`.
+- `ClaudeCompletionCommand { model: ClaudeModel, system_prompt: Option<String>, messages: Vec<ClaudeMessage>, max_tokens: u32, temperature: Option<f32> }` with `Default`. `max_tokens` is **required** at the type level because Anthropic's API rejects requests without it.
+- `ClaudeModel { Opus47, Sonnet46, Haiku45, Custom(String) }`.
+- Endpoint: `POST /v1/messages`. Response content is an array of typed content blocks; the seed parses and concatenates `text` blocks and surfaces `MalformedResponse` if no text is produced. Other block types (e.g., `tool_use`) are deserialized to a catch-all `Unknown` variant and dropped — handling them is M4+ work.
+- `ClaudeCompletionFailure` typed enum (full variant list above). Converted via `claude_failure_to_agnostic`.
+- Tests: success / multi-text-block concatenation / 401 / 429-with-`Retry-After` / 400 / 503 / 529 (Anthropic's "overloaded") / malformed-JSON / empty-content-`MalformedResponse` / model-serialization / `multi_infer` fan-out success. Plus 1 `#[ignore]` live test on `ANTHROPIC_API_KEY`.
+
+**M2c — Gemini: pending.** Same shape, accounting for Gemini's different URL / auth (`GOOGLE_API_KEY` or `GEMINI_API_KEY` via `?key=` query param), different request body, and different content shape. After M2c, retire `AgnosticCompletionError::ProviderStub`.
+
+**Extraction checkpoint.** Two providers now exhibit near-identical shape: both have a `WireRequest`/`WireMessage`/`WireErrorBody` set with diverging field semantics, both have a `map_failure_from_status` with the same 401/403/429/4xx/5xx mapping, both have a `parse_retry_after` (literally identical). Decision deferred until M2c lands so we evaluate against three concrete cases, not two. Candidates: `parse_retry_after` (lifts cleanly), `map_failure_from_status` (lifts as a generic over `*CompletionFailure`-like outputs), `WireErrorBody` (Anthropic and OpenAI share `{"error":{"message":"..."}}`; Gemini probably differs).
+
+- **Verify per provider:** `mockito` parsing tests covering success, each typed failure variant, and the `MalformedResponse` empty-content edge; `#[ignore]`-gated integration tests that hit real APIs when keys are present (`cargo test -- --ignored`).
 
 ### M3 — Embedding + Diversification
 

@@ -9,7 +9,10 @@ use futures::{FutureExt, StreamExt};
 
 use crate::ai_client_apis::{claude::*, gemini::*, openai::*};
 
-pub use crate::ai_client_apis::claude::{ClaudeClient, ClaudeCompletionCommand};
+pub use crate::ai_client_apis::claude::{
+    ClaudeClient, ClaudeClientError, ClaudeCompletionCommand, ClaudeMessage, ClaudeModel,
+    ClaudeRole,
+};
 pub use crate::ai_client_apis::gemini::{GeminiClient, GeminiCompletionCommand};
 pub use crate::ai_client_apis::openai::{
     OpenAiClient, OpenAiClientError, OpenAiCompletionCommand, OpenAiMessage, OpenAiModel,
@@ -159,6 +162,38 @@ pub struct ProviderAttempt {
     pub latency: Duration,
 }
 
+fn claude_failure_to_agnostic(
+    failure: crate::ai_client_apis::claude::ClaudeCompletionFailure,
+) -> AgnosticCompletionError {
+    use crate::ai_client_apis::claude::ClaudeCompletionFailure as F;
+    let provider = ProviderKind::Claude;
+    match failure {
+        F::Transport(source) => AgnosticCompletionError::Transport { provider, source },
+        F::Deserialize(source) => AgnosticCompletionError::Deserialize { provider, source },
+        F::Auth { message } => AgnosticCompletionError::Auth { provider, message },
+        F::RateLimited {
+            retry_after,
+            message,
+        } => AgnosticCompletionError::RateLimited {
+            provider,
+            retry_after,
+            message,
+        },
+        F::InvalidRequest { message } => AgnosticCompletionError::InvalidRequest {
+            provider,
+            message,
+        },
+        F::ServerError { status, message } => AgnosticCompletionError::ServerError {
+            provider,
+            status,
+            message,
+        },
+        F::MalformedResponse { reason } => {
+            AgnosticCompletionError::MalformedResponse { provider, reason }
+        }
+    }
+}
+
 fn openai_failure_to_agnostic(
     failure: crate::ai_client_apis::openai::OpenAiCompletionFailure,
 ) -> AgnosticCompletionError {
@@ -206,16 +241,14 @@ fn convert_raw_result_to_agnostic_output(
             Err(failure) => Err(openai_failure_to_agnostic(failure)),
         },
         RawAiCompletionResult::Claude(result) => match result {
-            Ok(_success) => Ok(AgnosticCompletionOutput {
-                chunks: vec![],
+            Ok(success) => Ok(AgnosticCompletionOutput {
+                chunks: vec![CompletionOutputChunk::Text(success.content)],
                 tokens_used: CompletionOutputTokensUsed {
-                    input: 0,
-                    output: 0,
+                    input: success.input_tokens,
+                    output: success.output_tokens,
                 },
             }),
-            Err(_failure) => Err(AgnosticCompletionError::ProviderStub {
-                provider: ProviderKind::Claude,
-            }),
+            Err(failure) => Err(claude_failure_to_agnostic(failure)),
         },
         RawAiCompletionResult::Gemini(result) => match result {
             Ok(_success) => Ok(AgnosticCompletionOutput {
@@ -376,25 +409,25 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::{
-        AiCompletionInputs, ClaudeClient, ClaudeCompletionCommand, CompletionOutputChunk,
-        GeminiClient, GeminiCompletionCommand, MultiAiCompletionInputs, OpenAiClient,
-        OpenAiCompletionCommand, OpenAiMessage, OpenAiModel, OpenAiRole, ProviderKind,
+        AiCompletionInputs, ClaudeClient, ClaudeCompletionCommand, ClaudeMessage, ClaudeModel,
+        ClaudeRole, CompletionOutputChunk, GeminiClient, GeminiCompletionCommand,
+        MultiAiCompletionInputs, OpenAiClient, OpenAiCompletionCommand, OpenAiMessage,
+        OpenAiModel, OpenAiRole, ProviderKind,
     };
 
     use super::multi_infer;
 
     #[tokio::test]
     async fn multi_infer_returns_one_attempt_per_stub_input_with_failures_preserved() {
-        let claude_client = ClaudeClient {};
-        let claude_command = ClaudeCompletionCommand {};
         let gemini_client = GeminiClient {};
         let gemini_command_a = GeminiCompletionCommand {};
         let gemini_command_b = GeminiCompletionCommand {};
+        let gemini_command_c = GeminiCompletionCommand {};
 
         let inputs = [
             AiCompletionInputs::Gemini(&gemini_client, &gemini_command_a),
-            AiCompletionInputs::Claude(&claude_client, &claude_command),
             AiCompletionInputs::Gemini(&gemini_client, &gemini_command_b),
+            AiCompletionInputs::Gemini(&gemini_client, &gemini_command_c),
         ];
         let multi = MultiAiCompletionInputs::new(&inputs);
 
@@ -407,8 +440,8 @@ mod tests {
         );
 
         let providers: HashSet<ProviderKind> = attempts.iter().map(|a| a.provider).collect();
-        assert!(providers.contains(&ProviderKind::Claude));
         assert!(providers.contains(&ProviderKind::Gemini));
+        assert_eq!(providers.len(), 1, "only Gemini stub remains at this point");
 
         let mut seen_indices: Vec<usize> = attempts.iter().map(|a| a.input_index).collect();
         seen_indices.sort();
@@ -422,7 +455,7 @@ mod tests {
             let err = attempt
                 .result
                 .as_ref()
-                .expect_err("Claude/Gemini stubs always Err until their M2 slice lands");
+                .expect_err("Gemini stub always Err until its M2 slice lands");
             assert_eq!(err.provider(), attempt.provider);
             assert_eq!(attempt.retries, 0, "ProviderStub is non-transient");
         }
@@ -430,16 +463,15 @@ mod tests {
 
     #[tokio::test]
     async fn multi_infer_preserves_input_index_with_duplicate_same_provider_inputs() {
-        let claude_client = ClaudeClient {};
-        let claude_command_a = ClaudeCompletionCommand {};
-        let claude_command_b = ClaudeCompletionCommand {};
         let gemini_client = GeminiClient {};
-        let gemini_command = GeminiCompletionCommand {};
+        let gemini_command_a = GeminiCompletionCommand {};
+        let gemini_command_b = GeminiCompletionCommand {};
+        let gemini_command_c = GeminiCompletionCommand {};
 
         let inputs = [
-            AiCompletionInputs::Claude(&claude_client, &claude_command_a),
-            AiCompletionInputs::Gemini(&gemini_client, &gemini_command),
-            AiCompletionInputs::Claude(&claude_client, &claude_command_b),
+            AiCompletionInputs::Gemini(&gemini_client, &gemini_command_a),
+            AiCompletionInputs::Gemini(&gemini_client, &gemini_command_b),
+            AiCompletionInputs::Gemini(&gemini_client, &gemini_command_c),
         ];
         let multi = MultiAiCompletionInputs::new(&inputs);
 
@@ -448,12 +480,59 @@ mod tests {
 
         attempts.sort_by_key(|a| a.input_index);
 
-        assert_eq!(attempts[0].input_index, 0);
-        assert_eq!(attempts[0].provider, ProviderKind::Claude);
-        assert_eq!(attempts[1].input_index, 1);
-        assert_eq!(attempts[1].provider, ProviderKind::Gemini);
-        assert_eq!(attempts[2].input_index, 2);
-        assert_eq!(attempts[2].provider, ProviderKind::Claude);
+        for (i, attempt) in attempts.iter().enumerate() {
+            assert_eq!(attempt.input_index, i);
+            assert_eq!(attempt.provider, ProviderKind::Gemini);
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_infer_claude_success_path_emits_real_text_and_tokens() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/messages")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "content": [{"type": "text", "text": "claude fan-out works"}],
+                    "usage": {"input_tokens": 12, "output_tokens": 7}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let claude_client = ClaudeClient::new("k".to_string()).with_base_url(server.url());
+        let claude_command = ClaudeCompletionCommand {
+            model: ClaudeModel::Sonnet46,
+            system_prompt: None,
+            messages: vec![ClaudeMessage {
+                role: ClaudeRole::User,
+                content: "go".to_string(),
+            }],
+            max_tokens: 16,
+            temperature: None,
+        };
+        let inputs = [AiCompletionInputs::Claude(&claude_client, &claude_command)];
+        let multi = MultiAiCompletionInputs::new(&inputs);
+
+        let attempts = multi_infer(&multi).await;
+        assert_eq!(attempts.len(), 1);
+        let attempt = &attempts[0];
+        assert_eq!(attempt.provider, ProviderKind::Claude);
+        assert_eq!(attempt.input_index, 0);
+
+        let output = attempt
+            .result
+            .as_ref()
+            .expect("Claude path must produce a real output, not ProviderStub");
+
+        match output.chunks.as_slice() {
+            [CompletionOutputChunk::Text(text)] => assert_eq!(text, "claude fan-out works"),
+            other => panic!("expected a single text chunk, got {other:?}"),
+        }
+        assert_eq!(output.tokens_used.input, 12);
+        assert_eq!(output.tokens_used.output, 7);
     }
 
     #[tokio::test]
@@ -604,7 +683,7 @@ pub fn make_sortable_judgement_command(
 ) -> AiCompletionCommand {
     match provider {
         SortableJudgementProvider::Claude => {
-            AiCompletionCommand::Claude(ClaudeCompletionCommand {})
+            AiCompletionCommand::Claude(ClaudeCompletionCommand::default())
         }
         SortableJudgementProvider::Gemini => {
             AiCompletionCommand::Gemini(GeminiCompletionCommand {})
