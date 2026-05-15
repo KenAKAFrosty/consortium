@@ -9,8 +9,12 @@ use futures::{FutureExt, StreamExt};
 
 use crate::ai_client_apis::{claude::*, gemini::*, openai::*};
 
+pub use crate::ai_client_apis::claude::{ClaudeClient, ClaudeCompletionCommand};
+pub use crate::ai_client_apis::gemini::{GeminiClient, GeminiCompletionCommand};
+pub use crate::ai_client_apis::openai::{OpenAiClient, OpenAiCompletionCommand};
+
 #[derive(Clone, Copy)]
-enum AiCompletionInputs<'a> {
+pub enum AiCompletionInputs<'a> {
     Gemini(&'a GeminiClient, &'a GeminiCompletionCommand),
     OpenAi(&'a OpenAiClient, &'a OpenAiCompletionCommand),
     Claude(&'a ClaudeClient, &'a ClaudeCompletionCommand),
@@ -21,7 +25,13 @@ enum AiCompletionInputs<'a> {
 }
 
 pub struct MultiAiCompletionInputs<'a> {
-    completion_inputs: &'a Vec<AiCompletionInputs<'a>>,
+    completion_inputs: &'a [AiCompletionInputs<'a>],
+}
+
+impl<'a> MultiAiCompletionInputs<'a> {
+    pub fn new(completion_inputs: &'a [AiCompletionInputs<'a>]) -> Self {
+        Self { completion_inputs }
+    }
 }
 
 #[derive(Debug)]
@@ -129,6 +139,7 @@ pub struct AgnosticCompletionOutput {
 #[derive(Debug)]
 pub struct ProviderAttempt {
     pub provider: ProviderKind,
+    pub input_index: usize,
     pub result: Result<AgnosticCompletionOutput, AgnosticCompletionError>,
     pub retries: u32,
     pub latency: Duration,
@@ -254,6 +265,7 @@ fn jitter_within(max_ms: u64) -> u64 {
 
 fn build_attempt<'a, F, Fut>(
     provider: ProviderKind,
+    input_index: usize,
     raw_op: F,
 ) -> BoxFuture<'a, ProviderAttempt>
 where
@@ -266,6 +278,7 @@ where
         let outcome = run_with_retry(DEFAULT_MAX_ATTEMPTS, DEFAULT_BASE_DELAY, raw_op).await;
         ProviderAttempt {
             provider,
+            input_index,
             result: outcome.result,
             retries: outcome.retries,
             latency: outcome.latency,
@@ -277,10 +290,11 @@ where
 pub async fn multi_infer<'a>(inputs: &'a MultiAiCompletionInputs<'a>) -> Vec<ProviderAttempt> {
     let mut in_flight: FuturesUnordered<BoxFuture<'a, ProviderAttempt>> = FuturesUnordered::new();
 
-    for input in inputs.completion_inputs.iter().copied() {
+    for (input_index, input) in inputs.completion_inputs.iter().copied().enumerate() {
         let attempt_future = match input {
             AiCompletionInputs::Claude(client, command) => build_attempt(
                 ProviderKind::Claude,
+                input_index,
                 move || async move {
                     let raw = claude_get_completion(client, command).await;
                     convert_raw_result_to_agnostic_output(RawAiCompletionResult::Claude(raw))
@@ -288,6 +302,7 @@ pub async fn multi_infer<'a>(inputs: &'a MultiAiCompletionInputs<'a>) -> Vec<Pro
             ),
             AiCompletionInputs::OpenAi(client, command) => build_attempt(
                 ProviderKind::OpenAi,
+                input_index,
                 move || async move {
                     let raw = openai_get_completion(client, command).await;
                     convert_raw_result_to_agnostic_output(RawAiCompletionResult::OpenAi(raw))
@@ -295,6 +310,7 @@ pub async fn multi_infer<'a>(inputs: &'a MultiAiCompletionInputs<'a>) -> Vec<Pro
             ),
             AiCompletionInputs::Gemini(client, command) => build_attempt(
                 ProviderKind::Gemini,
+                input_index,
                 move || async move {
                     let raw = gemini_get_completion(client, command).await;
                     convert_raw_result_to_agnostic_output(RawAiCompletionResult::Gemini(raw))
@@ -316,12 +332,9 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::{
-        AiCompletionInputs, MultiAiCompletionInputs, ProviderKind,
-        ai_client_apis::{
-            claude::{ClaudeClient, ClaudeCompletionCommand},
-            gemini::{GeminiClient, GeminiCompletionCommand},
-            openai::{OpenAiClient, OpenAiCompletionCommand},
-        },
+        AiCompletionInputs, ClaudeClient, ClaudeCompletionCommand, GeminiClient,
+        GeminiCompletionCommand, MultiAiCompletionInputs, OpenAiClient, OpenAiCompletionCommand,
+        ProviderKind,
     };
 
     use super::multi_infer;
@@ -335,14 +348,12 @@ mod tests {
         let gemini_client = GeminiClient {};
         let gemini_command = GeminiCompletionCommand {};
 
-        let inputs = vec![
+        let inputs = [
             AiCompletionInputs::Gemini(&gemini_client, &gemini_command),
             AiCompletionInputs::OpenAi(&openai_client, &openai_command),
             AiCompletionInputs::Claude(&claude_client, &claude_command),
         ];
-        let multi = MultiAiCompletionInputs {
-            completion_inputs: &inputs,
-        };
+        let multi = MultiAiCompletionInputs::new(&inputs);
 
         let attempts = multi_infer(&multi).await;
 
@@ -357,6 +368,14 @@ mod tests {
         assert!(providers.contains(&ProviderKind::OpenAi));
         assert!(providers.contains(&ProviderKind::Gemini));
 
+        let mut seen_indices: Vec<usize> = attempts.iter().map(|a| a.input_index).collect();
+        seen_indices.sort();
+        assert_eq!(
+            seen_indices,
+            vec![0, 1, 2],
+            "every input slot must appear exactly once"
+        );
+
         for attempt in &attempts {
             let err = attempt
                 .result
@@ -365,6 +384,34 @@ mod tests {
             assert_eq!(err.provider(), attempt.provider);
             assert_eq!(attempt.retries, 0, "ProviderStub is non-transient");
         }
+    }
+
+    #[tokio::test]
+    async fn multi_infer_preserves_input_index_with_duplicate_same_provider_inputs() {
+        let claude_client = ClaudeClient {};
+        let claude_command_a = ClaudeCompletionCommand {};
+        let claude_command_b = ClaudeCompletionCommand {};
+        let gemini_client = GeminiClient {};
+        let gemini_command = GeminiCompletionCommand {};
+
+        let inputs = [
+            AiCompletionInputs::Claude(&claude_client, &claude_command_a),
+            AiCompletionInputs::Gemini(&gemini_client, &gemini_command),
+            AiCompletionInputs::Claude(&claude_client, &claude_command_b),
+        ];
+        let multi = MultiAiCompletionInputs::new(&inputs);
+
+        let mut attempts = multi_infer(&multi).await;
+        assert_eq!(attempts.len(), 3);
+
+        attempts.sort_by_key(|a| a.input_index);
+
+        assert_eq!(attempts[0].input_index, 0);
+        assert_eq!(attempts[0].provider, ProviderKind::Claude);
+        assert_eq!(attempts[1].input_index, 1);
+        assert_eq!(attempts[1].provider, ProviderKind::Gemini);
+        assert_eq!(attempts[2].input_index, 2);
+        assert_eq!(attempts[2].provider, ProviderKind::Claude);
     }
 }
 
