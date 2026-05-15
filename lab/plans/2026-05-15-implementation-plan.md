@@ -16,7 +16,7 @@ Date: 2026-05-15
 
 Secondary use case: the same machinery doubles as a "consortium" inference SDK for runtime calls (slower, costlier, higher quality). The crate also incidentally yields a normalized set of provider clients.
 
-Provider modules (`src/ai_client_apis/{claude,openai,gemini,deepseek,kimik2,qwen,llama}/mod.rs`) still hold stub `Client`, `CompletionCommand`, and `*_get_completion` shells; only Claude / OpenAI / Gemini are wired into `multi_infer`, the other four remain commented out through M7. M0 added the dependency baseline (`tokio` full, `futures`, `reqwest` rustls-tls + json, `serde` derive, `serde_json`, `thiserror`, `bytes`; dev-deps `tokio-test`, `mockito`) and moved agnostic output types to owned payloads. M1 landed the async fan-out: `multi_infer` is now `pub async fn(&MultiAiCompletionInputs<'_>) -> Vec<ProviderAttempt>` with typed `AgnosticCompletionError`, `ProviderKind`, and a local retry helper; each `ProviderAttempt` carries `input_index` so callers can correlate results back to specific input slots even when the same provider repeats. The public construction path is `MultiAiCompletionInputs::new(&[AiCompletionInputs::…])` with the three active provider client/command types re-exported at the crate root. The boundary M2 picks up at is the empty Ok-arm bodies inside `convert_raw_result_to_agnostic_output` and the empty success types in the three active provider stubs — every successful provider call still produces an empty `AgnosticCompletionOutput` even though the wiring is now real.
+Provider modules: Claude / OpenAI / Gemini are real (M2a/b/c landed); Deepseek / Kimi / Qwen / Llama remain stubs commented out of `multi_infer` until M7. M0 added the dependency baseline (`tokio` full, `futures`, `reqwest` rustls-tls + json, `serde` derive, `serde_json`, `thiserror`, `bytes`; dev-deps `tokio-test`, `mockito`) and moved agnostic output types to owned payloads. M1 landed the async fan-out: `multi_infer` is `pub async fn(&MultiAiCompletionInputs<'_>) -> Vec<ProviderAttempt>` with typed `AgnosticCompletionError`, `ProviderKind`, and a local retry helper; each `ProviderAttempt` carries `input_index` so callers can correlate results back to specific input slots even when the same provider repeats. The public construction path is `MultiAiCompletionInputs::new(&[AiCompletionInputs::…])`, with active provider client / command / model / message / role types re-exported at the crate root. M2 landed real clients for all three target providers: each provider's `*Client` (with `new` / `from_env` / `with_base_url`), typed `*Model` enum, `*CompletionCommand`, mockito-tested wire path, and per-provider failure mapping into `AgnosticCompletionError`. The `AgnosticCompletionError::ProviderStub` variant is now unreachable in `multi_infer` and is slated for removal in the extraction-checkpoint pass after M2c. The boundary the next phase picks up at is M3 (embeddings + diversification).
 
 **Decisions locked in via Q&A + plan review:**
 - Initial provider depth: Claude, OpenAI, Gemini only. Deepseek/Kimi/Qwen/Llama stay as stubs until M7.
@@ -78,6 +78,8 @@ Sequenced as one provider at a time, validating the shape on the first before re
 - `convert_raw_result_to_agnostic_output` OpenAI arm populates a text chunk and real token counts.
 - Tests: success / 401 / 403 / 429-with-`Retry-After` / 400 / 503 / malformed-JSON / empty-choices-`MalformedResponse` / model-serialization / `multi_infer` fan-out success / `multi_infer` 503-driven retry verifying `ProviderAttempt.retries == 2`. Plus 1 `#[ignore]` live test on `OPENAI_API_KEY`.
 
+`OpenAiModel` was subsequently narrowed (commit `b15a099`) to `{ Gpt4oMini, Gpt4o, Gpt4Turbo, Custom(String) }`. The o-series variants (`O1`, `O1Mini`, `O3Mini`) were dropped because OpenAI reasoning models require `max_completion_tokens` (not `max_tokens`) and `developer` role (not `system`); the current chat-completions wire path does not emit that shape. Adding o-series support is its own future slice with a branched request builder. `Custom` is documented as a chat-completions-shape-only escape hatch.
+
 **M2b — Claude: landed.**
 
 - `ClaudeClient` (`new` / `from_env` reading `ANTHROPIC_API_KEY` / `with_base_url`). Auth via `x-api-key` header and required `anthropic-version: 2023-06-01`.
@@ -87,9 +89,25 @@ Sequenced as one provider at a time, validating the shape on the first before re
 - `ClaudeCompletionFailure` typed enum (full variant list above). Converted via `claude_failure_to_agnostic`.
 - Tests: success / multi-text-block concatenation / 401 / 429-with-`Retry-After` / 400 / 503 / 529 (Anthropic's "overloaded") / malformed-JSON / empty-content-`MalformedResponse` / model-serialization / `multi_infer` fan-out success. Plus 1 `#[ignore]` live test on `ANTHROPIC_API_KEY`.
 
-**M2c — Gemini: pending.** Same shape, accounting for Gemini's different URL / auth (`GOOGLE_API_KEY` or `GEMINI_API_KEY` via `?key=` query param), different request body, and different content shape. After M2c, retire `AgnosticCompletionError::ProviderStub`.
+**M2c — Gemini: landed.**
 
-**Extraction checkpoint.** Two providers now exhibit near-identical shape: both have a `WireRequest`/`WireMessage`/`WireErrorBody` set with diverging field semantics, both have a `map_failure_from_status` with the same 401/403/429/4xx/5xx mapping, both have a `parse_retry_after` (literally identical). Decision deferred until M2c lands so we evaluate against three concrete cases, not two. Candidates: `parse_retry_after` (lifts cleanly), `map_failure_from_status` (lifts as a generic over `*CompletionFailure`-like outputs), `WireErrorBody` (Anthropic and OpenAI share `{"error":{"message":"..."}}`; Gemini probably differs).
+- `GeminiClient` (`new` / `from_env` reading `GEMINI_API_KEY` / `with_base_url`). Auth via `x-goog-api-key` header (the URL `?key=` query form is also supported by the API but the header path is cleaner for mocking and avoids the key surfacing in logs / URLs).
+- `GeminiCompletionCommand { model: GeminiModel, system_prompt: Option<String>, messages: Vec<GeminiMessage>, max_tokens: Option<u32>, temperature: Option<f32> }` with `Default`. `max_tokens` stays `Option<u32>` because Google's API does not require it.
+- `GeminiModel { Gemini20Flash, Gemini15Pro, Gemini15Flash, Custom(String) }`.
+- `GeminiRole { User, Model }` — Gemini's API uses `model` rather than `assistant` for prior-turn replies, so the role enum exposes the API-native name.
+- Endpoint: `POST {base_url}/v1beta/models/{model}:generateContent`. The model id is part of the URL path, not the request body. The request body uses `contents` (Gemini's name for messages), a top-level `systemInstruction` field for the system prompt, and a nested `generationConfig` object for `maxOutputTokens` / `temperature`.
+- Response: `candidates[].content.parts[]` where each part may carry `text`. The seed concatenates all text parts and surfaces `MalformedResponse` if candidates is empty or no text parts are present. Non-text parts (e.g., `inlineData`, `functionCall`) deserialize but their text field is `None` and they're filtered out.
+- `GeminiCompletionFailure` typed enum (same variant list as OpenAI / Claude). Converted via `gemini_failure_to_agnostic`.
+- Tests: success / multi-text-part concatenation / 401 / 429-with-`Retry-After` / 400 / 503 / malformed-JSON / empty-candidates-`MalformedResponse` / empty-text-parts-`MalformedResponse` / model-serialization / `multi_infer` fan-out success. Plus 1 `#[ignore]` live test on `GEMINI_API_KEY`.
+
+**Extraction checkpoint (post-M2c, pending).** All three providers now share the same surface shape with diverging wire semantics. Specific candidates the extraction pass should evaluate:
+
+- `parse_retry_after` — byte-identical across OpenAI / Claude / Gemini. Cleanest extraction candidate.
+- `map_failure_from_status` — same 401/403 → Auth, 429 → RateLimited, 4xx → InvalidRequest, 5xx → ServerError mapping in all three. Differs only in the failure enum it produces. Lifts as a small generic helper that takes a constructor function per category, or as a `trait ProviderFailureBuilder` if we want named methods. Pick the smaller of the two.
+- `WireErrorBody { error: { message } }` — OpenAI, Anthropic, and Google all share this shape (Google's body also carries `code` / `status` fields but `message` is what we need). Lift cleanly.
+- Retire `AgnosticCompletionError::ProviderStub` — now unreachable in `multi_infer`. Drop the variant from `provider()` / `is_transient()` and update any compile errors.
+
+Per the seed-first constraint, no helpers were extracted during M2c itself. The extraction is its own scoped slice with no provider behavior changes.
 
 - **Verify per provider:** `mockito` parsing tests covering success, each typed failure variant, and the `MalformedResponse` empty-content edge; `#[ignore]`-gated integration tests that hit real APIs when keys are present (`cargo test -- --ignored`).
 

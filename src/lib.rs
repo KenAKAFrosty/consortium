@@ -13,7 +13,10 @@ pub use crate::ai_client_apis::claude::{
     ClaudeClient, ClaudeClientError, ClaudeCompletionCommand, ClaudeMessage, ClaudeModel,
     ClaudeRole,
 };
-pub use crate::ai_client_apis::gemini::{GeminiClient, GeminiCompletionCommand};
+pub use crate::ai_client_apis::gemini::{
+    GeminiClient, GeminiClientError, GeminiCompletionCommand, GeminiMessage, GeminiModel,
+    GeminiRole,
+};
 pub use crate::ai_client_apis::openai::{
     OpenAiClient, OpenAiClientError, OpenAiCompletionCommand, OpenAiMessage, OpenAiModel,
     OpenAiRole,
@@ -162,6 +165,38 @@ pub struct ProviderAttempt {
     pub latency: Duration,
 }
 
+fn gemini_failure_to_agnostic(
+    failure: crate::ai_client_apis::gemini::GeminiCompletionFailure,
+) -> AgnosticCompletionError {
+    use crate::ai_client_apis::gemini::GeminiCompletionFailure as F;
+    let provider = ProviderKind::Gemini;
+    match failure {
+        F::Transport(source) => AgnosticCompletionError::Transport { provider, source },
+        F::Deserialize(source) => AgnosticCompletionError::Deserialize { provider, source },
+        F::Auth { message } => AgnosticCompletionError::Auth { provider, message },
+        F::RateLimited {
+            retry_after,
+            message,
+        } => AgnosticCompletionError::RateLimited {
+            provider,
+            retry_after,
+            message,
+        },
+        F::InvalidRequest { message } => AgnosticCompletionError::InvalidRequest {
+            provider,
+            message,
+        },
+        F::ServerError { status, message } => AgnosticCompletionError::ServerError {
+            provider,
+            status,
+            message,
+        },
+        F::MalformedResponse { reason } => {
+            AgnosticCompletionError::MalformedResponse { provider, reason }
+        }
+    }
+}
+
 fn claude_failure_to_agnostic(
     failure: crate::ai_client_apis::claude::ClaudeCompletionFailure,
 ) -> AgnosticCompletionError {
@@ -251,16 +286,14 @@ fn convert_raw_result_to_agnostic_output(
             Err(failure) => Err(claude_failure_to_agnostic(failure)),
         },
         RawAiCompletionResult::Gemini(result) => match result {
-            Ok(_success) => Ok(AgnosticCompletionOutput {
-                chunks: vec![],
+            Ok(success) => Ok(AgnosticCompletionOutput {
+                chunks: vec![CompletionOutputChunk::Text(success.content)],
                 tokens_used: CompletionOutputTokensUsed {
-                    input: 0,
-                    output: 0,
+                    input: success.input_tokens,
+                    output: success.output_tokens,
                 },
             }),
-            Err(_failure) => Err(AgnosticCompletionError::ProviderStub {
-                provider: ProviderKind::Gemini,
-            }),
+            Err(failure) => Err(gemini_failure_to_agnostic(failure)),
         },
     }
 }
@@ -406,72 +439,61 @@ pub async fn multi_infer<'a>(inputs: &'a MultiAiCompletionInputs<'a>) -> Vec<Pro
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use crate::{
         AiCompletionInputs, ClaudeClient, ClaudeCompletionCommand, ClaudeMessage, ClaudeModel,
-        ClaudeRole, CompletionOutputChunk, GeminiClient, GeminiCompletionCommand,
-        MultiAiCompletionInputs, OpenAiClient, OpenAiCompletionCommand, OpenAiMessage,
-        OpenAiModel, OpenAiRole, ProviderKind,
+        ClaudeRole, CompletionOutputChunk, GeminiClient, GeminiCompletionCommand, GeminiMessage,
+        GeminiModel, GeminiRole, MultiAiCompletionInputs, OpenAiClient, OpenAiCompletionCommand,
+        OpenAiMessage, OpenAiModel, OpenAiRole, ProviderKind,
     };
 
     use super::multi_infer;
 
     #[tokio::test]
-    async fn multi_infer_returns_one_attempt_per_stub_input_with_failures_preserved() {
-        let gemini_client = GeminiClient {};
-        let gemini_command_a = GeminiCompletionCommand {};
-        let gemini_command_b = GeminiCompletionCommand {};
-        let gemini_command_c = GeminiCompletionCommand {};
-
-        let inputs = [
-            AiCompletionInputs::Gemini(&gemini_client, &gemini_command_a),
-            AiCompletionInputs::Gemini(&gemini_client, &gemini_command_b),
-            AiCompletionInputs::Gemini(&gemini_client, &gemini_command_c),
-        ];
-        let multi = MultiAiCompletionInputs::new(&inputs);
-
-        let attempts = multi_infer(&multi).await;
-
-        assert_eq!(
-            attempts.len(),
-            inputs.len(),
-            "every input should produce exactly one ProviderAttempt"
-        );
-
-        let providers: HashSet<ProviderKind> = attempts.iter().map(|a| a.provider).collect();
-        assert!(providers.contains(&ProviderKind::Gemini));
-        assert_eq!(providers.len(), 1, "only Gemini stub remains at this point");
-
-        let mut seen_indices: Vec<usize> = attempts.iter().map(|a| a.input_index).collect();
-        seen_indices.sort();
-        assert_eq!(
-            seen_indices,
-            vec![0, 1, 2],
-            "every input slot must appear exactly once"
-        );
-
-        for attempt in &attempts {
-            let err = attempt
-                .result
-                .as_ref()
-                .expect_err("Gemini stub always Err until its M2 slice lands");
-            assert_eq!(err.provider(), attempt.provider);
-            assert_eq!(attempt.retries, 0, "ProviderStub is non-transient");
-        }
-    }
-
-    #[tokio::test]
     async fn multi_infer_preserves_input_index_with_duplicate_same_provider_inputs() {
-        let gemini_client = GeminiClient {};
-        let gemini_command_a = GeminiCompletionCommand {};
-        let gemini_command_b = GeminiCompletionCommand {};
-        let gemini_command_c = GeminiCompletionCommand {};
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect(3)
+            .create_async()
+            .await;
+
+        let client = OpenAiClient::new("k".to_string()).with_base_url(server.url());
+        let cmd_a = OpenAiCompletionCommand {
+            model: OpenAiModel::Gpt4oMini,
+            system_prompt: None,
+            messages: vec![OpenAiMessage {
+                role: OpenAiRole::User,
+                content: "a".to_string(),
+            }],
+            max_tokens: Some(8),
+            temperature: None,
+        };
+        let cmd_b = OpenAiCompletionCommand {
+            messages: vec![OpenAiMessage {
+                role: OpenAiRole::User,
+                content: "b".to_string(),
+            }],
+            ..cmd_a.clone()
+        };
+        let cmd_c = OpenAiCompletionCommand {
+            messages: vec![OpenAiMessage {
+                role: OpenAiRole::User,
+                content: "c".to_string(),
+            }],
+            ..cmd_a.clone()
+        };
 
         let inputs = [
-            AiCompletionInputs::Gemini(&gemini_client, &gemini_command_a),
-            AiCompletionInputs::Gemini(&gemini_client, &gemini_command_b),
-            AiCompletionInputs::Gemini(&gemini_client, &gemini_command_c),
+            AiCompletionInputs::OpenAi(&client, &cmd_a),
+            AiCompletionInputs::OpenAi(&client, &cmd_b),
+            AiCompletionInputs::OpenAi(&client, &cmd_c),
         ];
         let multi = MultiAiCompletionInputs::new(&inputs);
 
@@ -479,11 +501,63 @@ mod tests {
         assert_eq!(attempts.len(), 3);
 
         attempts.sort_by_key(|a| a.input_index);
-
         for (i, attempt) in attempts.iter().enumerate() {
             assert_eq!(attempt.input_index, i);
-            assert_eq!(attempt.provider, ProviderKind::Gemini);
+            assert_eq!(attempt.provider, ProviderKind::OpenAi);
+            assert!(
+                attempt.result.is_ok(),
+                "duplicate same-provider inputs should all succeed independently"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn multi_infer_gemini_success_path_emits_real_text_and_tokens() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1beta/models/gemini-1.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "candidates": [{"content": {"parts": [{"text": "gemini fan-out works"}]}}],
+                    "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 5}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let gemini_client = GeminiClient::new("k".to_string()).with_base_url(server.url());
+        let gemini_command = GeminiCompletionCommand {
+            model: GeminiModel::Gemini15Flash,
+            system_prompt: None,
+            messages: vec![GeminiMessage {
+                role: GeminiRole::User,
+                content: "go".to_string(),
+            }],
+            max_tokens: Some(16),
+            temperature: None,
+        };
+        let inputs = [AiCompletionInputs::Gemini(&gemini_client, &gemini_command)];
+        let multi = MultiAiCompletionInputs::new(&inputs);
+
+        let attempts = multi_infer(&multi).await;
+        assert_eq!(attempts.len(), 1);
+        let attempt = &attempts[0];
+        assert_eq!(attempt.provider, ProviderKind::Gemini);
+        assert_eq!(attempt.input_index, 0);
+
+        let output = attempt
+            .result
+            .as_ref()
+            .expect("Gemini path must produce a real output, not ProviderStub");
+
+        match output.chunks.as_slice() {
+            [CompletionOutputChunk::Text(text)] => assert_eq!(text, "gemini fan-out works"),
+            other => panic!("expected a single text chunk, got {other:?}"),
+        }
+        assert_eq!(output.tokens_used.input, 9);
+        assert_eq!(output.tokens_used.output, 5);
     }
 
     #[tokio::test]
@@ -686,7 +760,7 @@ pub fn make_sortable_judgement_command(
             AiCompletionCommand::Claude(ClaudeCompletionCommand::default())
         }
         SortableJudgementProvider::Gemini => {
-            AiCompletionCommand::Gemini(GeminiCompletionCommand {})
+            AiCompletionCommand::Gemini(GeminiCompletionCommand::default())
         }
         SortableJudgementProvider::OpenAi => {
             AiCompletionCommand::OpenAi(OpenAiCompletionCommand::default())
