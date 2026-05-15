@@ -11,7 +11,9 @@ use crate::ai_client_apis::{claude::*, gemini::*, openai::*};
 
 pub use crate::ai_client_apis::claude::{ClaudeClient, ClaudeCompletionCommand};
 pub use crate::ai_client_apis::gemini::{GeminiClient, GeminiCompletionCommand};
-pub use crate::ai_client_apis::openai::{OpenAiClient, OpenAiCompletionCommand};
+pub use crate::ai_client_apis::openai::{
+    OpenAiClient, OpenAiClientError, OpenAiCompletionCommand, OpenAiMessage, OpenAiRole,
+};
 
 #[derive(Clone, Copy)]
 pub enum AiCompletionInputs<'a> {
@@ -112,28 +114,28 @@ impl AgnosticCompletionError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CompletionOutputImage {
     Base64(String),
     Raw(bytes::Bytes),
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CompletionOutputChunk {
     Text(String),
     Image(CompletionOutputImage),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 //TOOD: Make this more detailed with breakdowns like # of reasoning tokens, or system tokens vs other input tokens, etc.
 pub struct CompletionOutputTokensUsed {
-    input: u64,
-    output: u64,
+    pub input: u64,
+    pub output: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AgnosticCompletionOutput {
-    chunks: Vec<CompletionOutputChunk>,
-    tokens_used: CompletionOutputTokensUsed,
+    pub chunks: Vec<CompletionOutputChunk>,
+    pub tokens_used: CompletionOutputTokensUsed,
 }
 
 #[derive(Debug)]
@@ -145,21 +147,44 @@ pub struct ProviderAttempt {
     pub latency: Duration,
 }
 
+fn openai_failure_to_agnostic(
+    failure: crate::ai_client_apis::openai::OpenAiCompletionFailure,
+) -> AgnosticCompletionError {
+    use crate::ai_client_apis::openai::OpenAiCompletionFailure as F;
+    let provider = ProviderKind::OpenAi;
+    match failure {
+        F::Transport(source) => AgnosticCompletionError::Transport { provider, source },
+        F::Deserialize(source) => AgnosticCompletionError::Deserialize { provider, source },
+        F::Auth { .. } => AgnosticCompletionError::Auth { provider },
+        F::RateLimited { retry_after, .. } => AgnosticCompletionError::RateLimited {
+            provider,
+            retry_after,
+        },
+        F::InvalidRequest { message } => AgnosticCompletionError::InvalidRequest {
+            provider,
+            message,
+        },
+        F::ServerError { status, message } => AgnosticCompletionError::ServerError {
+            provider,
+            status,
+            message,
+        },
+    }
+}
+
 fn convert_raw_result_to_agnostic_output(
     raw_result: RawAiCompletionResult,
 ) -> Result<AgnosticCompletionOutput, AgnosticCompletionError> {
     match raw_result {
         RawAiCompletionResult::OpenAi(result) => match result {
-            Ok(_success) => Ok(AgnosticCompletionOutput {
-                chunks: vec![],
+            Ok(success) => Ok(AgnosticCompletionOutput {
+                chunks: vec![CompletionOutputChunk::Text(success.content)],
                 tokens_used: CompletionOutputTokensUsed {
-                    input: 0,
-                    output: 0,
+                    input: success.prompt_tokens,
+                    output: success.completion_tokens,
                 },
             }),
-            Err(_failure) => Err(AgnosticCompletionError::ProviderStub {
-                provider: ProviderKind::OpenAi,
-            }),
+            Err(failure) => Err(openai_failure_to_agnostic(failure)),
         },
         RawAiCompletionResult::Claude(result) => match result {
             Ok(_success) => Ok(AgnosticCompletionOutput {
@@ -332,26 +357,25 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::{
-        AiCompletionInputs, ClaudeClient, ClaudeCompletionCommand, GeminiClient,
-        GeminiCompletionCommand, MultiAiCompletionInputs, OpenAiClient, OpenAiCompletionCommand,
-        ProviderKind,
+        AiCompletionInputs, ClaudeClient, ClaudeCompletionCommand, CompletionOutputChunk,
+        GeminiClient, GeminiCompletionCommand, MultiAiCompletionInputs, OpenAiClient,
+        OpenAiCompletionCommand, OpenAiMessage, OpenAiRole, ProviderKind,
     };
 
     use super::multi_infer;
 
     #[tokio::test]
-    async fn multi_infer_returns_one_attempt_per_input_with_failures_preserved() {
+    async fn multi_infer_returns_one_attempt_per_stub_input_with_failures_preserved() {
         let claude_client = ClaudeClient {};
         let claude_command = ClaudeCompletionCommand {};
-        let openai_client = OpenAiClient {};
-        let openai_command = OpenAiCompletionCommand {};
         let gemini_client = GeminiClient {};
-        let gemini_command = GeminiCompletionCommand {};
+        let gemini_command_a = GeminiCompletionCommand {};
+        let gemini_command_b = GeminiCompletionCommand {};
 
         let inputs = [
-            AiCompletionInputs::Gemini(&gemini_client, &gemini_command),
-            AiCompletionInputs::OpenAi(&openai_client, &openai_command),
+            AiCompletionInputs::Gemini(&gemini_client, &gemini_command_a),
             AiCompletionInputs::Claude(&claude_client, &claude_command),
+            AiCompletionInputs::Gemini(&gemini_client, &gemini_command_b),
         ];
         let multi = MultiAiCompletionInputs::new(&inputs);
 
@@ -365,7 +389,6 @@ mod tests {
 
         let providers: HashSet<ProviderKind> = attempts.iter().map(|a| a.provider).collect();
         assert!(providers.contains(&ProviderKind::Claude));
-        assert!(providers.contains(&ProviderKind::OpenAi));
         assert!(providers.contains(&ProviderKind::Gemini));
 
         let mut seen_indices: Vec<usize> = attempts.iter().map(|a| a.input_index).collect();
@@ -380,7 +403,7 @@ mod tests {
             let err = attempt
                 .result
                 .as_ref()
-                .expect_err("stub providers always Err in M1");
+                .expect_err("Claude/Gemini stubs always Err until their M2 slice lands");
             assert_eq!(err.provider(), attempt.provider);
             assert_eq!(attempt.retries, 0, "ProviderStub is non-transient");
         }
@@ -412,6 +435,55 @@ mod tests {
         assert_eq!(attempts[1].provider, ProviderKind::Gemini);
         assert_eq!(attempts[2].input_index, 2);
         assert_eq!(attempts[2].provider, ProviderKind::Claude);
+    }
+
+    #[tokio::test]
+    async fn multi_infer_openai_success_path_emits_real_text_and_tokens() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "fan-out works"}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 4}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let openai_client = OpenAiClient::new("k".to_string()).with_base_url(server.url());
+        let openai_command = OpenAiCompletionCommand {
+            model: "gpt-4o-mini".to_string(),
+            system_prompt: None,
+            messages: vec![OpenAiMessage {
+                role: OpenAiRole::User,
+                content: "go".to_string(),
+            }],
+            max_tokens: Some(16),
+            temperature: None,
+        };
+        let inputs = [AiCompletionInputs::OpenAi(&openai_client, &openai_command)];
+        let multi = MultiAiCompletionInputs::new(&inputs);
+
+        let attempts = multi_infer(&multi).await;
+        assert_eq!(attempts.len(), 1);
+        let attempt = &attempts[0];
+        assert_eq!(attempt.provider, ProviderKind::OpenAi);
+        assert_eq!(attempt.input_index, 0);
+
+        let output = attempt
+            .result
+            .as_ref()
+            .expect("OpenAI path must produce a real output, not ProviderStub");
+
+        match output.chunks.as_slice() {
+            [CompletionOutputChunk::Text(text)] => assert_eq!(text, "fan-out works"),
+            other => panic!("expected a single text chunk, got {other:?}"),
+        }
+        assert_eq!(output.tokens_used.input, 10);
+        assert_eq!(output.tokens_used.output, 4);
     }
 }
 
@@ -461,7 +533,7 @@ pub fn make_sortable_judgement_command(
             AiCompletionCommand::Gemini(GeminiCompletionCommand {})
         }
         SortableJudgementProvider::OpenAi => {
-            AiCompletionCommand::OpenAi(OpenAiCompletionCommand {})
+            AiCompletionCommand::OpenAi(OpenAiCompletionCommand::default())
         }
     }
 }

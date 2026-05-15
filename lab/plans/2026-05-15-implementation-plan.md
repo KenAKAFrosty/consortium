@@ -61,14 +61,23 @@ Status: landed.
 
 ### M2 — Three Real Provider Clients
 
-For each of Claude, OpenAI, Gemini under `src/ai_client_apis/<name>/mod.rs`:
+Sequenced as one provider at a time, validating the shape on the first before replicating it. Each provider lives under `src/ai_client_apis/<name>/mod.rs` and follows the same contract.
 
-- Concrete `Client` reading API key from `{PROVIDER}_API_KEY`, holds a `reqwest::Client`.
-- Concrete `CompletionCommand` carrying model, system prompt, messages, max-tokens, temperature.
-- Real HTTP request + serde-derived response types.
-- Per-provider response → owned `AgnosticCompletionOutput` mapping inside the existing match arms of `convert_raw_result_to_agnostic_output` (`src/lib.rs:58-84`); the current empty-vec stubs become real conversions and lifetime parameters should disappear from the public output model if they have not already.
-- Populate `CompletionOutputTokensUsed { input, output }` (`src/lib.rs:47`). The "more detailed breakdown" TODO at `src/lib.rs:46` is deferred to M10.
-- **Verify:** `mockito`-backed unit tests for response parsing; `#[ignore]`-gated integration tests that hit real APIs when keys are present (`cargo test -- --ignored`).
+**M2a — OpenAI (seed): landed.** See [2026-05-15-openai-seed-shape](../journal/2026-05-15-openai-seed-shape.md) for the concrete client / command / failure / wire-type shape that Claude and Gemini should mirror. Key points:
+
+- `OpenAiClient` holds a `reqwest::Client`, base URL (configurable for `mockito`), and `api_key`. Constructors: `new`, `from_env` (reads `OPENAI_API_KEY`), `with_base_url` (builder-style override).
+- `OpenAiCompletionCommand` carries model, optional system_prompt, messages, optional max_tokens, optional temperature; implements `Default`.
+- `OpenAiCompletionFailure` is a typed enum mirroring agnostic categories (Transport / Deserialize / Auth / RateLimited / InvalidRequest / ServerError) — provider-level typed errors are converted to `AgnosticCompletionError` via `openai_failure_to_agnostic` in `lib.rs`. `ProviderStub` retires for OpenAI but stays for Claude and Gemini.
+- `convert_raw_result_to_agnostic_output` OpenAI arm now populates a text chunk and real token counts.
+- Tests: 7 `mockito`-driven (success, 401, 403, 429 with `Retry-After`, 400, 503, malformed JSON) plus 1 `#[ignore]` live test gated on `OPENAI_API_KEY`; plus a `multi_infer` end-to-end mock that proves real text + tokens flow through the M1 fan-out contract.
+
+**M2b — Claude: pending.** Replicate the OpenAI shape: `ClaudeClient` with `from_env` (`ANTHROPIC_API_KEY`) + `with_base_url`, `ClaudeCompletionCommand`, `ClaudeCompletionFailure` enum, mockito tests, live test, `claude_failure_to_agnostic` in lib.rs, real conversion in `convert_raw_result_to_agnostic_output`.
+
+**M2c — Gemini: pending.** Same shape, accounting for Gemini's different URL/auth scheme (`GOOGLE_API_KEY` / `GEMINI_API_KEY` query param, different request body).
+
+Cross-cutting: once two providers have landed, evaluate whether shared helpers (e.g., a generic `parse_retry_after`, a status-mapping helper, a common `ProviderFailure` shape) are worth extracting. Per the M2 seed constraint, do not extract until the second provider proves the same shape applies.
+
+- **Verify per provider:** `mockito` parsing tests covering success and each typed failure variant; `#[ignore]`-gated integration tests that hit real APIs when keys are present (`cargo test -- --ignored`).
 
 ### M3 — Embedding + Diversification
 

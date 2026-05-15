@@ -14,6 +14,7 @@ Journal entries are compact lab notes. They should record what was tried, what w
 ## Entries
 
 - [2026-05-15 — Initial Repo Read And Planning](./2026-05-15-initial-repo-read-and-planning.md)
+- [2026-05-15 — OpenAI Seed Shape For M2](./2026-05-15-openai-seed-shape.md)
 
 ## See Also
 
