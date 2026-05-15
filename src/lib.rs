@@ -12,7 +12,8 @@ use crate::ai_client_apis::{claude::*, gemini::*, openai::*};
 pub use crate::ai_client_apis::claude::{ClaudeClient, ClaudeCompletionCommand};
 pub use crate::ai_client_apis::gemini::{GeminiClient, GeminiCompletionCommand};
 pub use crate::ai_client_apis::openai::{
-    OpenAiClient, OpenAiClientError, OpenAiCompletionCommand, OpenAiMessage, OpenAiRole,
+    OpenAiClient, OpenAiClientError, OpenAiCompletionCommand, OpenAiMessage, OpenAiModel,
+    OpenAiRole,
 };
 
 #[derive(Clone, Copy)]
@@ -72,9 +73,13 @@ pub enum AgnosticCompletionError {
     RateLimited {
         provider: ProviderKind,
         retry_after: Option<Duration>,
+        message: Option<String>,
     },
     #[error("{provider:?}: authentication failed")]
-    Auth { provider: ProviderKind },
+    Auth {
+        provider: ProviderKind,
+        message: Option<String>,
+    },
     #[error("{provider:?}: invalid request: {message}")]
     InvalidRequest {
         provider: ProviderKind,
@@ -86,6 +91,11 @@ pub enum AgnosticCompletionError {
         status: u16,
         message: Option<String>,
     },
+    #[error("{provider:?}: response malformed: {reason}")]
+    MalformedResponse {
+        provider: ProviderKind,
+        reason: String,
+    },
     #[error("{provider:?}: stub provider has no real client yet")]
     ProviderStub { provider: ProviderKind },
 }
@@ -96,9 +106,10 @@ impl AgnosticCompletionError {
             Self::Transport { provider, .. }
             | Self::Deserialize { provider, .. }
             | Self::RateLimited { provider, .. }
-            | Self::Auth { provider }
+            | Self::Auth { provider, .. }
             | Self::InvalidRequest { provider, .. }
             | Self::ServerError { provider, .. }
+            | Self::MalformedResponse { provider, .. }
             | Self::ProviderStub { provider } => *provider,
         }
     }
@@ -109,6 +120,7 @@ impl AgnosticCompletionError {
             Self::Deserialize { .. }
             | Self::Auth { .. }
             | Self::InvalidRequest { .. }
+            | Self::MalformedResponse { .. }
             | Self::ProviderStub { .. } => false,
         }
     }
@@ -155,10 +167,14 @@ fn openai_failure_to_agnostic(
     match failure {
         F::Transport(source) => AgnosticCompletionError::Transport { provider, source },
         F::Deserialize(source) => AgnosticCompletionError::Deserialize { provider, source },
-        F::Auth { .. } => AgnosticCompletionError::Auth { provider },
-        F::RateLimited { retry_after, .. } => AgnosticCompletionError::RateLimited {
+        F::Auth { message } => AgnosticCompletionError::Auth { provider, message },
+        F::RateLimited {
+            retry_after,
+            message,
+        } => AgnosticCompletionError::RateLimited {
             provider,
             retry_after,
+            message,
         },
         F::InvalidRequest { message } => AgnosticCompletionError::InvalidRequest {
             provider,
@@ -169,6 +185,9 @@ fn openai_failure_to_agnostic(
             status,
             message,
         },
+        F::MalformedResponse { reason } => {
+            AgnosticCompletionError::MalformedResponse { provider, reason }
+        }
     }
 }
 
@@ -359,7 +378,7 @@ mod tests {
     use crate::{
         AiCompletionInputs, ClaudeClient, ClaudeCompletionCommand, CompletionOutputChunk,
         GeminiClient, GeminiCompletionCommand, MultiAiCompletionInputs, OpenAiClient,
-        OpenAiCompletionCommand, OpenAiMessage, OpenAiRole, ProviderKind,
+        OpenAiCompletionCommand, OpenAiMessage, OpenAiModel, OpenAiRole, ProviderKind,
     };
 
     use super::multi_infer;
@@ -455,7 +474,7 @@ mod tests {
 
         let openai_client = OpenAiClient::new("k".to_string()).with_base_url(server.url());
         let openai_command = OpenAiCompletionCommand {
-            model: "gpt-4o-mini".to_string(),
+            model: OpenAiModel::Gpt4oMini,
             system_prompt: None,
             messages: vec![OpenAiMessage {
                 role: OpenAiRole::User,
@@ -484,6 +503,64 @@ mod tests {
         }
         assert_eq!(output.tokens_used.input, 10);
         assert_eq!(output.tokens_used.output, 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multi_infer_openai_transient_503_drives_retry_then_surfaces_failure() {
+        use crate::AgnosticCompletionError;
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(503)
+            .with_body(r#"{"error":{"message":"upstream busy"}}"#)
+            .expect(3)
+            .create_async()
+            .await;
+
+        let openai_client = OpenAiClient::new("k".to_string()).with_base_url(server.url());
+        let openai_command = OpenAiCompletionCommand {
+            model: OpenAiModel::Gpt4oMini,
+            system_prompt: None,
+            messages: vec![OpenAiMessage {
+                role: OpenAiRole::User,
+                content: "go".to_string(),
+            }],
+            max_tokens: Some(8),
+            temperature: None,
+        };
+        let inputs = [AiCompletionInputs::OpenAi(&openai_client, &openai_command)];
+        let multi = MultiAiCompletionInputs::new(&inputs);
+
+        let attempts = multi_infer(&multi).await;
+        assert_eq!(attempts.len(), 1);
+        let attempt = &attempts[0];
+
+        assert_eq!(attempt.provider, ProviderKind::OpenAi);
+        assert_eq!(attempt.input_index, 0);
+        assert_eq!(
+            attempt.retries, 2,
+            "DEFAULT_MAX_ATTEMPTS=3 → 1 initial + 2 retries"
+        );
+
+        let err = attempt
+            .result
+            .as_ref()
+            .expect_err("503 is transient but should exhaust retries and surface as ServerError");
+        match err {
+            AgnosticCompletionError::ServerError {
+                provider,
+                status,
+                message,
+            } => {
+                assert_eq!(*provider, ProviderKind::OpenAi);
+                assert_eq!(*status, 503);
+                assert_eq!(message.as_deref(), Some("upstream busy"));
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+
+        mock.assert_async().await;
     }
 }
 

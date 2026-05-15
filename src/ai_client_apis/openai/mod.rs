@@ -54,6 +54,44 @@ impl OpenAiRole {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenAiModel {
+    Gpt4oMini,
+    Gpt4o,
+    O1,
+    O1Mini,
+    O3Mini,
+    Custom(String),
+}
+
+impl OpenAiModel {
+    pub fn as_api_str(&self) -> &str {
+        match self {
+            Self::Gpt4oMini => "gpt-4o-mini",
+            Self::Gpt4o => "gpt-4o",
+            Self::O1 => "o1",
+            Self::O1Mini => "o1-mini",
+            Self::O3Mini => "o3-mini",
+            Self::Custom(s) => s.as_str(),
+        }
+    }
+}
+
+impl std::fmt::Display for OpenAiModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_api_str())
+    }
+}
+
+impl Serialize for OpenAiModel {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_api_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAiMessage {
     pub role: OpenAiRole,
@@ -62,7 +100,7 @@ pub struct OpenAiMessage {
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompletionCommand {
-    pub model: String,
+    pub model: OpenAiModel,
     pub system_prompt: Option<String>,
     pub messages: Vec<OpenAiMessage>,
     pub max_tokens: Option<u32>,
@@ -72,7 +110,7 @@ pub struct OpenAiCompletionCommand {
 impl Default for OpenAiCompletionCommand {
     fn default() -> Self {
         Self {
-            model: "gpt-4o-mini".to_string(),
+            model: OpenAiModel::Gpt4oMini,
             system_prompt: None,
             messages: Vec::new(),
             max_tokens: None,
@@ -108,13 +146,15 @@ pub enum OpenAiCompletionFailure {
         status: u16,
         message: Option<String>,
     },
+    #[error("openai response malformed: {reason}")]
+    MalformedResponse { reason: String },
 }
 
 pub type OpenAiResult = Result<OpenAiCompletionSuccess, OpenAiCompletionFailure>;
 
 #[derive(Serialize)]
 struct WireRequest<'a> {
-    model: &'a str,
+    model: &'a OpenAiModel,
     messages: &'a [WireMessage<'a>],
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
@@ -206,14 +246,13 @@ pub async fn openai_get_completion(
     if status.is_success() {
         let parsed: WireResponse =
             serde_json::from_slice(&bytes).map_err(OpenAiCompletionFailure::Deserialize)?;
-        let content = parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .unwrap_or_default();
+        let first_choice = parsed.choices.into_iter().next().ok_or_else(|| {
+            OpenAiCompletionFailure::MalformedResponse {
+                reason: "response contained no choices".to_string(),
+            }
+        })?;
         Ok(OpenAiCompletionSuccess {
-            content,
+            content: first_choice.message.content,
             prompt_tokens: parsed.usage.prompt_tokens,
             completion_tokens: parsed.usage.completion_tokens,
         })
@@ -258,7 +297,7 @@ mod tests {
 
     fn sample_command() -> OpenAiCompletionCommand {
         OpenAiCompletionCommand {
-            model: "gpt-4o-mini".to_string(),
+            model: OpenAiModel::Gpt4oMini,
             system_prompt: Some("You are a helpful assistant.".to_string()),
             messages: vec![OpenAiMessage {
                 role: OpenAiRole::User,
@@ -403,6 +442,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn openai_model_serializes_to_expected_wire_value() {
+        assert_eq!(OpenAiModel::Gpt4oMini.as_api_str(), "gpt-4o-mini");
+        assert_eq!(OpenAiModel::Gpt4o.as_api_str(), "gpt-4o");
+        assert_eq!(OpenAiModel::O1.as_api_str(), "o1");
+        assert_eq!(OpenAiModel::O1Mini.as_api_str(), "o1-mini");
+        assert_eq!(OpenAiModel::O3Mini.as_api_str(), "o3-mini");
+        assert_eq!(
+            OpenAiModel::Custom("gpt-4-turbo".to_string()).as_api_str(),
+            "gpt-4-turbo"
+        );
+
+        assert_eq!(OpenAiModel::Gpt4o.to_string(), "gpt-4o");
+
+        let json = serde_json::to_string(&OpenAiModel::Gpt4oMini).expect("serialize");
+        assert_eq!(json, r#""gpt-4o-mini""#);
+        let json_custom =
+            serde_json::to_string(&OpenAiModel::Custom("o3".to_string())).expect("serialize");
+        assert_eq!(json_custom, r#""o3""#);
+    }
+
+    #[tokio::test]
+    async fn empty_choices_maps_to_malformed_response() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":0}}"#)
+            .create_async()
+            .await;
+
+        let client = OpenAiClient::new("test-key".to_string()).with_base_url(server.url());
+        let err = openai_get_completion(&client, &sample_command())
+            .await
+            .expect_err("empty choices must surface as a typed failure");
+        match err {
+            OpenAiCompletionFailure::MalformedResponse { reason } => {
+                assert!(reason.contains("no choices"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected MalformedResponse, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn malformed_json_maps_to_deserialize() {
         let mut server = mockito::Server::new_async().await;
@@ -425,7 +507,7 @@ mod tests {
     async fn live_openai_completion_returns_real_response() {
         let client = OpenAiClient::from_env().expect("OPENAI_API_KEY must be set");
         let command = OpenAiCompletionCommand {
-            model: "gpt-4o-mini".to_string(),
+            model: OpenAiModel::Gpt4oMini,
             system_prompt: Some("Reply with exactly the word 'pong'.".to_string()),
             messages: vec![OpenAiMessage {
                 role: OpenAiRole::User,
