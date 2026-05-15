@@ -58,9 +58,11 @@ impl OpenAiRole {
 pub enum OpenAiModel {
     Gpt4oMini,
     Gpt4o,
-    O1,
-    O1Mini,
-    O3Mini,
+    Gpt4Turbo,
+    /// Escape hatch for chat-completions-compatible models that have not been added
+    /// to this enum yet. Not appropriate for reasoning models (o1, o3, etc.) — those
+    /// require `max_completion_tokens` instead of `max_tokens` and `developer` role
+    /// in place of `system`, neither of which this seed emits.
     Custom(String),
 }
 
@@ -69,9 +71,7 @@ impl OpenAiModel {
         match self {
             Self::Gpt4oMini => "gpt-4o-mini",
             Self::Gpt4o => "gpt-4o",
-            Self::O1 => "o1",
-            Self::O1Mini => "o1-mini",
-            Self::O3Mini => "o3-mini",
+            Self::Gpt4Turbo => "gpt-4-turbo",
             Self::Custom(s) => s.as_str(),
         }
     }
@@ -446,21 +446,19 @@ mod tests {
     fn openai_model_serializes_to_expected_wire_value() {
         assert_eq!(OpenAiModel::Gpt4oMini.as_api_str(), "gpt-4o-mini");
         assert_eq!(OpenAiModel::Gpt4o.as_api_str(), "gpt-4o");
-        assert_eq!(OpenAiModel::O1.as_api_str(), "o1");
-        assert_eq!(OpenAiModel::O1Mini.as_api_str(), "o1-mini");
-        assert_eq!(OpenAiModel::O3Mini.as_api_str(), "o3-mini");
+        assert_eq!(OpenAiModel::Gpt4Turbo.as_api_str(), "gpt-4-turbo");
         assert_eq!(
-            OpenAiModel::Custom("gpt-4-turbo".to_string()).as_api_str(),
-            "gpt-4-turbo"
+            OpenAiModel::Custom("gpt-3.5-turbo".to_string()).as_api_str(),
+            "gpt-3.5-turbo"
         );
 
         assert_eq!(OpenAiModel::Gpt4o.to_string(), "gpt-4o");
 
         let json = serde_json::to_string(&OpenAiModel::Gpt4oMini).expect("serialize");
         assert_eq!(json, r#""gpt-4o-mini""#);
-        let json_custom =
-            serde_json::to_string(&OpenAiModel::Custom("o3".to_string())).expect("serialize");
-        assert_eq!(json_custom, r#""o3""#);
+        let json_custom = serde_json::to_string(&OpenAiModel::Custom("gpt-4-turbo".to_string()))
+            .expect("serialize");
+        assert_eq!(json_custom, r#""gpt-4-turbo""#);
     }
 
     #[tokio::test]
