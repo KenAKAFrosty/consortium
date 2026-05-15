@@ -30,14 +30,14 @@ enum RawAiCompletionResult {
 }
 
 #[derive(Debug)]
-enum CompletionOutputImage<'a> {
-    Base64(&'a str),
-    Raw(&'a Vec<u8>), //will likely get the bytes package and use that here instead of a Vec<u8>
+pub enum CompletionOutputImage {
+    Base64(String),
+    Raw(bytes::Bytes),
 }
 #[derive(Debug)]
-enum CompletionOutputChunk<'a> {
-    Text(&'a str),
-    Image(CompletionOutputImage<'a>),
+pub enum CompletionOutputChunk {
+    Text(String),
+    Image(CompletionOutputImage),
 }
 
 #[derive(Debug)]
@@ -48,14 +48,14 @@ pub struct CompletionOutputTokensUsed {
 }
 
 #[derive(Debug)]
-pub struct AgnosticCompletionOutput<'a> {
-    chunks: Vec<CompletionOutputChunk<'a>>,
+pub struct AgnosticCompletionOutput {
+    chunks: Vec<CompletionOutputChunk>,
     tokens_used: CompletionOutputTokensUsed,
 }
 
-pub fn convert_raw_result_to_agnostic_output<'a>(
+pub fn convert_raw_result_to_agnostic_output(
     raw_result: RawAiCompletionResult,
-) -> AgnosticCompletionOutput<'a> {
+) -> AgnosticCompletionOutput {
     match raw_result {
         RawAiCompletionResult::OpenAi(result) => AgnosticCompletionOutput {
             chunks: vec![],
@@ -82,7 +82,7 @@ pub fn convert_raw_result_to_agnostic_output<'a>(
 }
 
 //this will all become async, but at time of writing was offline so could not add tokio etc)
-pub fn multi_infer<'a>(inputs: &MultiAiCompletionInputs) -> Vec<AgnosticCompletionOutput<'a>> {
+pub fn multi_infer(inputs: &MultiAiCompletionInputs) -> Vec<AgnosticCompletionOutput> {
     println!("Running multi infer");
 
     //like here we could map into async functions and then run futures_unordered on them, etc.
@@ -168,9 +168,9 @@ xml style tag format, etc.
 "#;
 
 // #[derive(Deserialize)]
-pub struct OrderedJudgementStructuredData<'a> {
+pub struct OrderedJudgementStructuredData {
     //this can be where we have the corresponding IDs in order, something like
-    ordered_ids: Vec<&'a str>,
+    ordered_ids: Vec<String>,
 }
 
 pub enum SortableJudgementProvider {

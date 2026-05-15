@@ -16,7 +16,7 @@ Date: 2026-05-15
 
 Secondary use case: the same machinery doubles as a "consortium" inference SDK for runtime calls (slower, costlier, higher quality). The crate also incidentally yields a normalized set of provider clients.
 
-The repo currently contains only stub `Client`, `CompletionCommand`, and `*_get_completion` shells for seven providers (`src/ai_client_apis/{claude,openai,gemini,deepseek,kimik2,qwen,llama}/mod.rs`), an `AgnosticCompletionOutput` skeleton (`src/lib.rs:53`), a placeholder `multi_infer` that builds an empty `Vec` (`src/lib.rs:87-128`), and TODO scaffolding for the judgement phase (`src/lib.rs:164-205`). `Cargo.toml` has zero dependencies and no `tokio` runtime — that's the immediate blocker on doing anything async.
+The repo still contains stub `Client`, `CompletionCommand`, and `*_get_completion` shells for seven providers (`src/ai_client_apis/{claude,openai,gemini,deepseek,kimik2,qwen,llama}/mod.rs`), an `AgnosticCompletionOutput` skeleton, a placeholder `multi_infer` that returns an empty `Vec`, and TODO scaffolding for the judgement phase. As of M0 close-out, `Cargo.toml` carries `tokio` (full), `futures`, `reqwest` (rustls-tls + json), `serde` (derive), `serde_json`, `thiserror`, and `bytes` — dev-deps `tokio-test` and `mockito` — and the agnostic output types are owned (no lifetime parameters at the async/network boundary). The sync `multi_infer` placeholder is the boundary M1 picks up at.
 
 **Decisions locked in via Q&A + plan review:**
 - Initial provider depth: Claude, OpenAI, Gemini only. Deepseek/Kimi/Qwen/Llama stay as stubs until M7.
@@ -35,7 +35,6 @@ The repo currently contains only stub `Client`, `CompletionCommand`, and `*_get_
 - Keep `CONTRIBUTING.md` and the `lab/` indexes current as implementation decisions, experiments, and workflow expectations evolve.
 - Add `LICENSE-MIT` and `LICENSE-APACHE` text files.
 - Update `Cargo.toml` `[dependencies]`: `tokio` (full), `futures`, `reqwest` (rustls-tls, json), `serde` (derive), `serde_json`, `thiserror`, `bytes`. Dev-deps: `tokio-test`, `mockito`.
-- Delete the unused `use std::io::Bytes;` at `src/lib.rs:3`.
 - Replace the borrowed/lifetime-parameterized agnostic output scaffolding in `src/lib.rs` with owned payload shapes before real provider work starts. The conceptual types stay, but `&str` / `&Vec<u8>` output fields should not survive into M2.
 
 ### M1 — Async Runtime + Error Types
@@ -44,7 +43,7 @@ The repo currently contains only stub `Client`, `CompletionCommand`, and `*_get_
 - Introduce a structured fan-out result, e.g. `ProviderAttempt { provider, result, retries, latency }`, so `multi_infer` preserves both successes and failures per provider instead of returning only successful outputs.
 - Replace the placeholder `let raw_results: Vec<…> = vec![]` in `multi_infer` (`src/lib.rs:118`) with a real `FuturesUnordered`-based fan-out.
 - Add a small retry helper (exponential backoff with jitter). Concrete, not generic.
-- **Verify:** existing `scratchpad` test (`src/lib.rs:144`) drops its `panic!`, becomes async, and asserts that one `ProviderAttempt` is returned per input with no dropped attempts, even while stubs still error.
+- **Verify:** the existing `multi_infer_placeholder_returns_empty_vec` test becomes async, drops the empty-vec assertion, and asserts that one `ProviderAttempt` is returned per input with no dropped attempts, even while stubs still error.
 
 ### M2 — Three Real Provider Clients
 
