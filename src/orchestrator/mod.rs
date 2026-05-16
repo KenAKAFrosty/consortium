@@ -26,9 +26,39 @@
 //!   model is absent from [`CrossModelPhaseOutcome::candidates`] but visible in
 //!   [`ConsortiumOutcome::phase_one`] with `winner = None`.
 //!
-//! Streaming / hooks (`mpsc` channel, callback trait) are intentionally not in
-//! this slice — the in-memory result shape comes first; streaming can be added
-//! later as an alternative surface over the same orchestration.
+//! ## Streaming (M5c)
+//!
+//! [`consortium_completion`] keeps its M5a/b shape and remains the canonical
+//! surface — it returns the full typed [`ConsortiumOutcome`] with all
+//! provenance / failure information intact. [`consortium_completion_streaming`]
+//! is an additive view over the *same* orchestration: it accepts a
+//! [`tokio::sync::mpsc::UnboundedSender<PhaseEvent>`] and emits compact
+//! [`PhaseEvent`]s at well-defined checkpoints while still returning the same
+//! canonical [`ConsortiumOutcome`].
+//!
+//! Event semantics:
+//!
+//! - One [`PhaseEvent::PhaseOneSlotFinished`] per slot, emitted **in real
+//!   completion order** at the moment that slot's [`phase_one_for_slot`]
+//!   future yields (so the slot that finishes first is observed first, even
+//!   though `phase_one` in the returned outcome is still in slot-index order).
+//! - Exactly one [`PhaseEvent::PhaseTwoFinished`] at the end, always — even
+//!   when no slot produced a Phase 1 winner (the event then reports
+//!   `winner = None`, `candidates = 0`).
+//!
+//! Event payloads are deliberately compact: counts plus the cloneable
+//! [`PhaseOneWinner`] / [`PhaseTwoWinner`]. They do **not** carry the full
+//! per-sample [`ProviderAttempt`] or per-judge [`JudgeOutcome`], because those
+//! contain non-`Clone` error types ([`reqwest::Error`]). Callers that need
+//! full provenance read it from the returned canonical outcome; the events
+//! are a real-time progress view.
+//!
+//! Backpressure: the sender is unbounded so emission never blocks the
+//! orchestrator. If the receiver is dropped, sends silently fail (the typed
+//! outcome remains canonical and is still returned). [`consortium_completion`]
+//! delegates to the same internal body with `events = None`, so the two paths
+//! cannot diverge semantically — there is no separate "streaming
+//! orchestration" code path.
 //!
 //! ## Concurrency (M5b)
 //!
@@ -224,6 +254,127 @@ pub struct ConsortiumOutcome {
     pub phase_two: Option<CrossModelPhaseOutcome>,
 }
 
+/// Compact summary emitted at the moment a Phase 1 slot future yields its
+/// [`ModelPhaseOutcome`]. Carries enough provenance and counts for a real-time
+/// progress consumer; callers that need full per-sample / per-judge detail
+/// read it from the canonical [`ConsortiumOutcome`] returned at the end.
+///
+/// `winner` is `None` when the slot produced no winner — either no sample
+/// succeeded, or every judge failed on a multi-candidate set. The numeric
+/// counts below distinguish those two cases without requiring the consumer
+/// to clone the full `ModelPhaseOutcome`.
+#[derive(Debug, Clone)]
+pub struct PhaseOneSlotEvent {
+    pub slot_index: usize,
+    pub model_label: String,
+    pub provider: ProviderKind,
+    pub total_samples: usize,
+    pub successful_samples: usize,
+    pub failed_samples: usize,
+    /// Number of judges actually invoked for this slot. Zero when the slot
+    /// took the singleton short-circuit (one successful sample → trivial
+    /// winner) or had no successful samples to judge.
+    pub judges_run: usize,
+    pub judges_succeeded: usize,
+    pub judges_failed: usize,
+    pub winner: Option<PhaseOneWinner>,
+}
+
+impl PhaseOneSlotEvent {
+    fn from_outcome(slot_index: usize, outcome: &ModelPhaseOutcome) -> Self {
+        let total_samples = outcome.samples.len();
+        let successful_samples = outcome
+            .samples
+            .iter()
+            .filter(|s| s.attempt.result.is_ok())
+            .count();
+        let judges_run = outcome.judge_outcomes.len();
+        let judges_succeeded = outcome
+            .judge_outcomes
+            .iter()
+            .filter(|jo| jo.result.is_ok())
+            .count();
+        Self {
+            slot_index,
+            model_label: outcome.model_label.clone(),
+            provider: outcome.provider,
+            total_samples,
+            successful_samples,
+            failed_samples: total_samples - successful_samples,
+            judges_run,
+            judges_succeeded,
+            judges_failed: judges_run - judges_succeeded,
+            winner: outcome.winner.clone(),
+        }
+    }
+}
+
+/// Compact summary emitted once at the end of the orchestration, after the
+/// cross-model phase finishes (including when no Phase 1 slot produced a
+/// winner — in that case all counts are zero and `winner` is `None`).
+///
+/// Marks overall completion of the streaming run regardless of success.
+#[derive(Debug, Clone)]
+pub struct PhaseTwoFinishedEvent {
+    /// `None` when no Phase 1 slot produced a winner, OR when ≥2 candidates
+    /// reached Phase 2 but every cross-model judge failed.
+    pub winner: Option<PhaseTwoWinner>,
+    /// Number of slots that produced a Phase 1 winner and entered Phase 2.
+    pub candidates: usize,
+    /// Number of cross-model judges actually invoked. Zero when Phase 2 took
+    /// the singleton short-circuit (one surviving slot) or no slot produced
+    /// a winner.
+    pub judges_run: usize,
+    pub judges_succeeded: usize,
+    pub judges_failed: usize,
+}
+
+impl PhaseTwoFinishedEvent {
+    fn from_outcome(outcome: &Option<CrossModelPhaseOutcome>) -> Self {
+        match outcome {
+            None => Self {
+                winner: None,
+                candidates: 0,
+                judges_run: 0,
+                judges_succeeded: 0,
+                judges_failed: 0,
+            },
+            Some(p2) => {
+                let judges_run = p2.judge_outcomes.len();
+                let judges_succeeded = p2
+                    .judge_outcomes
+                    .iter()
+                    .filter(|jo| jo.result.is_ok())
+                    .count();
+                Self {
+                    winner: p2.winner.clone(),
+                    candidates: p2.candidates.len(),
+                    judges_run,
+                    judges_succeeded,
+                    judges_failed: judges_run - judges_succeeded,
+                }
+            }
+        }
+    }
+}
+
+/// Event emitted by [`consortium_completion_streaming`] at orchestration
+/// checkpoints. The canonical [`ConsortiumOutcome`] is still returned by the
+/// function — events are a real-time view, not a replacement for the typed
+/// outcome.
+///
+/// Emission order:
+/// 1. One [`Self::PhaseOneSlotFinished`] per slot, in **real completion
+///    order** (the slot whose `phase_one_for_slot` future yields first is
+///    observed first; this is not the same as `slot_index` order).
+/// 2. Exactly one [`Self::PhaseTwoFinished`] at the end, always — even when
+///    no slot produced a Phase 1 winner.
+#[derive(Debug, Clone)]
+pub enum PhaseEvent {
+    PhaseOneSlotFinished(PhaseOneSlotEvent),
+    PhaseTwoFinished(PhaseTwoFinishedEvent),
+}
+
 /// Run the two-phase consortium pipeline for a single prompt.
 ///
 /// `slots` describes which model calls to make and how many samples to draw
@@ -243,6 +394,32 @@ pub struct ConsortiumOutcome {
 pub async fn consortium_completion<'a>(
     slots: &'a [ConsortiumSlot<'a>],
     judges: &'a [&'a dyn JudgeProvider],
+) -> ConsortiumOutcome {
+    consortium_completion_impl(slots, judges, None).await
+}
+
+/// Streaming variant of [`consortium_completion`]. Returns the same canonical
+/// [`ConsortiumOutcome`] *and* emits [`PhaseEvent`]s on `events` at well-defined
+/// checkpoints (one per finalized Phase 1 slot in real completion order, plus
+/// one final [`PhaseEvent::PhaseTwoFinished`]).
+///
+/// The sender is unbounded so emission never blocks the orchestrator. If the
+/// receiver is dropped, sends silently fail — the canonical outcome remains
+/// the authoritative record and is still returned. The two public entry
+/// points share one internal body, so streaming and non-streaming cannot
+/// diverge semantically.
+pub async fn consortium_completion_streaming<'a>(
+    slots: &'a [ConsortiumSlot<'a>],
+    judges: &'a [&'a dyn JudgeProvider],
+    events: tokio::sync::mpsc::UnboundedSender<PhaseEvent>,
+) -> ConsortiumOutcome {
+    consortium_completion_impl(slots, judges, Some(&events)).await
+}
+
+async fn consortium_completion_impl<'a>(
+    slots: &'a [ConsortiumSlot<'a>],
+    judges: &'a [&'a dyn JudgeProvider],
+    events: Option<&tokio::sync::mpsc::UnboundedSender<PhaseEvent>>,
 ) -> ConsortiumOutcome {
     let total_samples: usize = slots.iter().map(|s| s.samples).sum();
     let mut fan_inputs: Vec<AiCompletionInputs<'a>> = Vec::with_capacity(total_samples);
@@ -295,6 +472,16 @@ pub async fn consortium_completion<'a>(
     let mut phase_one_buf: Vec<Option<ModelPhaseOutcome>> =
         (0..slots.len()).map(|_| None).collect();
     while let Some((slot_index, outcome)) = slot_fanout.next().await {
+        // Streaming hook: emit the compact slot summary in real completion
+        // order — this is the moment a Phase 1 slot is fully resolved
+        // (sampling + judging done). Send happens before the canonical
+        // reorder buffer stores `outcome`; the canonical `phase_one` is
+        // still in slot-index order regardless of emission order.
+        if let Some(tx) = events {
+            let _ = tx.send(PhaseEvent::PhaseOneSlotFinished(
+                PhaseOneSlotEvent::from_outcome(slot_index, &outcome),
+            ));
+        }
         phase_one_buf[slot_index] = Some(outcome);
     }
     let phase_one: Vec<ModelPhaseOutcome> = phase_one_buf
@@ -303,6 +490,12 @@ pub async fn consortium_completion<'a>(
         .collect();
 
     let phase_two = phase_two_outcome(&phase_one, judges).await;
+
+    if let Some(tx) = events {
+        let _ = tx.send(PhaseEvent::PhaseTwoFinished(
+            PhaseTwoFinishedEvent::from_outcome(&phase_two),
+        ));
+    }
 
     ConsortiumOutcome {
         phase_one,
@@ -1449,5 +1642,714 @@ mod tests {
         // winner, proving parallel fan-out did not break Borda.
         assert!(slot_a.aggregated.is_some());
         assert!(slot_a.winner.is_some());
+    }
+
+    // ---------- M5c: streaming PhaseEvent surface ----------
+
+    /// Drain every [`PhaseEvent`] from `rx`. The sender is moved by value
+    /// into [`consortium_completion_streaming`], so once that call returns
+    /// the channel is closed and `recv()` yields `None` after the buffered
+    /// events drain.
+    async fn collect_events(
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<PhaseEvent>,
+    ) -> Vec<PhaseEvent> {
+        let mut out = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// Phase 1 slot events arrive in **real completion order**: the slot
+    /// whose judging finishes first is observed first. The canonical
+    /// [`ConsortiumOutcome::phase_one`] is still in slot-index order. The
+    /// shape is proven by making slot 0 the slowest (60s virtual delay) and
+    /// asserting the first emitted slot event is *not* slot 0.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_emits_phase_one_events_in_real_completion_order_with_canonical_outcome_in_slot_order(
+    ) {
+        use std::time::Duration;
+
+        let mut server_a = mockito::Server::new_async().await;
+        let _ma = server_a
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "S0-content"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+        let mut server_b = mockito::Server::new_async().await;
+        let _mb = server_b
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "S1-content"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+        let mut server_c = mockito::Server::new_async().await;
+        let _mc = server_c
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "S2-content"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+
+        let client_a = OpenAiClient::new_with_base_url("k".to_string(), server_a.url());
+        let client_b = OpenAiClient::new_with_base_url("k".to_string(), server_b.url());
+        let client_c = OpenAiClient::new_with_base_url("k".to_string(), server_c.url());
+        let cmd_a = ok_command("a");
+        let cmd_b = ok_command("b");
+        let cmd_c = ok_command("c");
+
+        let slots = vec![
+            ConsortiumSlot {
+                input: AiCompletionInputs::OpenAi(&client_a, &cmd_a),
+                model_label: "slot-0".to_string(),
+                samples: 2,
+            },
+            ConsortiumSlot {
+                input: AiCompletionInputs::OpenAi(&client_b, &cmd_b),
+                model_label: "slot-1".to_string(),
+                samples: 2,
+            },
+            ConsortiumSlot {
+                input: AiCompletionInputs::OpenAi(&client_c, &cmd_c),
+                model_label: "slot-2".to_string(),
+                samples: 2,
+            },
+        ];
+
+        struct SlowSlot0Judge {
+            slow_marker: String,
+            slow_delay: Duration,
+        }
+        impl JudgeProvider for SlowSlot0Judge {
+            fn label(&self) -> &str {
+                "j"
+            }
+            fn invoke<'a>(
+                &'a self,
+                request: JudgeRequest,
+            ) -> BoxFuture<'a, Result<String, AgnosticCompletionError>> {
+                let slow_marker = self.slow_marker.clone();
+                let slow_delay = self.slow_delay;
+                Box::pin(async move {
+                    let user = request.user_message;
+                    if user.contains(&slow_marker) {
+                        tokio::time::sleep(slow_delay).await;
+                    }
+                    let n = user.matches("[c").count();
+                    let ids: Vec<String> = (1..=n).map(|i| format!("c{i}")).collect();
+                    Ok(format!(
+                        "<reasoning>r</reasoning><ranking>{}</ranking>",
+                        ids.join(",")
+                    ))
+                })
+            }
+        }
+
+        let j = SlowSlot0Judge {
+            slow_marker: "S0-content".to_string(),
+            slow_delay: Duration::from_secs(60),
+        };
+        let judges: Vec<&dyn JudgeProvider> = vec![&j];
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PhaseEvent>();
+        let outcome = consortium_completion_streaming(&slots, &judges, tx).await;
+        let events = collect_events(rx).await;
+
+        // Three Phase 1 events + one final Phase 2 event.
+        assert_eq!(events.len(), 4, "expected 3 Phase 1 + 1 Phase 2 events");
+
+        // First three events are Phase 1 slot events in real completion
+        // order; slot 0 finishes its judging last and must appear last
+        // among the Phase 1 events. We deliberately do not pin the relative
+        // order of slot-1 and slot-2 — they are both fast, so cooperative
+        // scheduling may resolve them in either order. The load-bearing
+        // invariant is "slot 0 is not first".
+        let phase_one_slot_indices: Vec<usize> = events[..3]
+            .iter()
+            .map(|ev| match ev {
+                PhaseEvent::PhaseOneSlotFinished(e) => e.slot_index,
+                PhaseEvent::PhaseTwoFinished(_) => {
+                    panic!("Phase 2 event arrived before all Phase 1 events")
+                }
+            })
+            .collect();
+        let slot_set: std::collections::HashSet<usize> =
+            phase_one_slot_indices.iter().copied().collect();
+        assert_eq!(
+            slot_set,
+            [0_usize, 1, 2].into_iter().collect(),
+            "all three slots must appear exactly once across Phase 1 events"
+        );
+        assert_ne!(
+            phase_one_slot_indices[0], 0,
+            "slot 0 was slowest — it must not be the first Phase 1 event emitted"
+        );
+        assert_eq!(
+            phase_one_slot_indices.last().copied(),
+            Some(0_usize),
+            "slot 0 was slowest — it must be the last Phase 1 event emitted"
+        );
+
+        // Final event is Phase 2 finished, regardless of slot order.
+        match &events[3] {
+            PhaseEvent::PhaseTwoFinished(e) => {
+                assert_eq!(e.candidates, 3, "all three slots produced winners");
+                assert!(e.winner.is_some());
+            }
+            other => panic!("expected PhaseTwoFinished as final event, got {other:?}"),
+        }
+
+        // Canonical outcome's `phase_one` is in slot-index order regardless
+        // of the streaming order above.
+        assert_eq!(outcome.phase_one.len(), 3);
+        let canonical_labels: Vec<&str> = outcome
+            .phase_one
+            .iter()
+            .map(|po| po.model_label.as_str())
+            .collect();
+        assert_eq!(canonical_labels, vec!["slot-0", "slot-1", "slot-2"]);
+    }
+
+    /// Happy-path two-phase run: the PhaseTwoFinished event's compact
+    /// summary matches the canonical [`CrossModelPhaseOutcome`]. Confirms
+    /// that the event payload is consistent with the typed outcome rather
+    /// than a separately-tracked count.
+    #[tokio::test]
+    async fn streaming_phase_two_finished_event_matches_canonical_outcome() {
+        let mut server_a = mockito::Server::new_async().await;
+        let _mock_a = server_a
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "alpha"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+        let mut server_b = mockito::Server::new_async().await;
+        let _mock_b = server_b
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "bravo"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+
+        let client_a = OpenAiClient::new_with_base_url("k".to_string(), server_a.url());
+        let client_b = OpenAiClient::new_with_base_url("k".to_string(), server_b.url());
+        let cmd_a = ok_command("a");
+        let cmd_b = ok_command("b");
+
+        let slots = vec![
+            ConsortiumSlot {
+                input: AiCompletionInputs::OpenAi(&client_a, &cmd_a),
+                model_label: "openai-a".to_string(),
+                samples: 2,
+            },
+            ConsortiumSlot {
+                input: AiCompletionInputs::OpenAi(&client_b, &cmd_b),
+                model_label: "openai-b".to_string(),
+                samples: 2,
+            },
+        ];
+
+        let always_c1_then_rest =
+            |req: JudgeRequest| -> Result<String, AgnosticCompletionError> {
+                let n = req.user_message.matches("[c").count();
+                let ids: Vec<String> = (1..=n).map(|i| format!("c{i}")).collect();
+                Ok(format!(
+                    "<reasoning>c1 wins</reasoning><ranking>{}</ranking>",
+                    ids.join(",")
+                ))
+            };
+        let j1 = FnJudge {
+            label: "j1".to_string(),
+            f: always_c1_then_rest,
+        };
+        let j2 = FnJudge {
+            label: "j2".to_string(),
+            f: always_c1_then_rest,
+        };
+        let judges: Vec<&dyn JudgeProvider> = vec![&j1, &j2];
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PhaseEvent>();
+        let outcome = consortium_completion_streaming(&slots, &judges, tx).await;
+        let events = collect_events(rx).await;
+
+        // Two Phase 1 events + one Phase 2 event. Each Phase 1 event has
+        // its slot's full counts.
+        assert_eq!(events.len(), 3);
+        for ev in &events[..2] {
+            match ev {
+                PhaseEvent::PhaseOneSlotFinished(e) => {
+                    assert_eq!(e.total_samples, 2);
+                    assert_eq!(e.successful_samples, 2);
+                    assert_eq!(e.failed_samples, 0);
+                    assert_eq!(e.judges_run, 2);
+                    assert_eq!(e.judges_succeeded, 2);
+                    assert_eq!(e.judges_failed, 0);
+                    assert!(e.winner.is_some());
+                }
+                other => panic!("expected PhaseOneSlotFinished, got {other:?}"),
+            }
+        }
+
+        let phase_two_event = match &events[2] {
+            PhaseEvent::PhaseTwoFinished(e) => e.clone(),
+            other => panic!("expected PhaseTwoFinished as final, got {other:?}"),
+        };
+        let canonical_p2 = outcome
+            .phase_two
+            .as_ref()
+            .expect("canonical phase_two should be Some");
+        assert_eq!(phase_two_event.candidates, canonical_p2.candidates.len());
+        assert_eq!(phase_two_event.candidates, 2);
+        assert_eq!(phase_two_event.judges_run, canonical_p2.judge_outcomes.len());
+        assert_eq!(phase_two_event.judges_run, 2);
+        assert_eq!(phase_two_event.judges_succeeded, 2);
+        assert_eq!(phase_two_event.judges_failed, 0);
+        let event_winner = phase_two_event
+            .winner
+            .as_ref()
+            .expect("event should carry winner");
+        let canonical_winner = canonical_p2
+            .winner
+            .as_ref()
+            .expect("canonical winner should be Some");
+        assert_eq!(event_winner.model_index, canonical_winner.model_index);
+        assert_eq!(event_winner.content, canonical_winner.content);
+        assert_eq!(event_winner.model_label, canonical_winner.model_label);
+        assert_eq!(event_winner.provider, canonical_winner.provider);
+    }
+
+    /// Failure preservation under the streaming surface: the canonical
+    /// [`ConsortiumOutcome`] keeps every failed sample and failed judge,
+    /// and the events' counts agree with what the canonical outcome
+    /// records. The streaming view does not silently drop failures.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_preserves_failed_attempts_and_failed_judges_in_canonical_outcome() {
+        let mut server_a = mockito::Server::new_async().await;
+        let _mock_a = server_a
+            .mock("POST", "/v1/chat/completions")
+            .with_status(503)
+            .with_body(r#"{"error":{"message":"upstream busy"}}"#)
+            .expect_at_least(6) // 2 samples × (1 + 2 retries)
+            .create_async()
+            .await;
+        let mut server_b = mockito::Server::new_async().await;
+        let _mock_b = server_b
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "bravo"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+
+        let client_a = OpenAiClient::new_with_base_url("k".to_string(), server_a.url());
+        let client_b = OpenAiClient::new_with_base_url("k".to_string(), server_b.url());
+        let cmd_a = ok_command("a");
+        let cmd_b = ok_command("b");
+        let slots = vec![
+            ConsortiumSlot {
+                input: AiCompletionInputs::OpenAi(&client_a, &cmd_a),
+                model_label: "openai-a".to_string(),
+                samples: 2,
+            },
+            ConsortiumSlot {
+                input: AiCompletionInputs::OpenAi(&client_b, &cmd_b),
+                model_label: "openai-b".to_string(),
+                samples: 2,
+            },
+        ];
+
+        let always_c1_then_rest =
+            |req: JudgeRequest| -> Result<String, AgnosticCompletionError> {
+                let n = req.user_message.matches("[c").count();
+                let ids: Vec<String> = (1..=n).map(|i| format!("c{i}")).collect();
+                Ok(format!(
+                    "<reasoning>c1 wins</reasoning><ranking>{}</ranking>",
+                    ids.join(",")
+                ))
+            };
+        let always_err = |_: JudgeRequest| -> Result<String, AgnosticCompletionError> {
+            Err(AgnosticCompletionError::Auth {
+                provider: ProviderKind::OpenAi,
+                message: Some("bad judge key".to_string()),
+            })
+        };
+        let j1 = FnJudge {
+            label: "j1".to_string(),
+            f: always_c1_then_rest,
+        };
+        let j2 = FnJudge {
+            label: "j2".to_string(),
+            f: always_err,
+        };
+        let judges: Vec<&dyn JudgeProvider> = vec![&j1, &j2];
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PhaseEvent>();
+        let outcome = consortium_completion_streaming(&slots, &judges, tx).await;
+        let events = collect_events(rx).await;
+
+        // Two Phase 1 events + one Phase 2 event.
+        assert_eq!(events.len(), 3);
+
+        // Find each Phase 1 event by slot_index (real completion order may
+        // place slot B before slot A because A retries 503s with backoff).
+        let mut slot_events: std::collections::HashMap<usize, PhaseOneSlotEvent> =
+            std::collections::HashMap::new();
+        let mut p2_event: Option<PhaseTwoFinishedEvent> = None;
+        for ev in events {
+            match ev {
+                PhaseEvent::PhaseOneSlotFinished(e) => {
+                    slot_events.insert(e.slot_index, e);
+                }
+                PhaseEvent::PhaseTwoFinished(e) => {
+                    assert!(p2_event.is_none(), "only one Phase 2 event expected");
+                    p2_event = Some(e);
+                }
+            }
+        }
+        assert_eq!(slot_events.len(), 2);
+
+        // Slot A: every sample failed → no winner, no judges run, 2 failed
+        // samples recorded.
+        let ev_a = slot_events.remove(&0).expect("slot A event");
+        assert_eq!(ev_a.model_label, "openai-a");
+        assert_eq!(ev_a.total_samples, 2);
+        assert_eq!(ev_a.successful_samples, 0);
+        assert_eq!(ev_a.failed_samples, 2);
+        assert_eq!(ev_a.judges_run, 0);
+        assert_eq!(ev_a.judges_succeeded, 0);
+        assert_eq!(ev_a.judges_failed, 0);
+        assert!(ev_a.winner.is_none());
+
+        // Slot B: both samples succeed; 2 judges run, 1 succeeds, 1 fails;
+        // still produces a winner via the successful judge.
+        let ev_b = slot_events.remove(&1).expect("slot B event");
+        assert_eq!(ev_b.model_label, "openai-b");
+        assert_eq!(ev_b.successful_samples, 2);
+        assert_eq!(ev_b.failed_samples, 0);
+        assert_eq!(ev_b.judges_run, 2);
+        assert_eq!(ev_b.judges_succeeded, 1);
+        assert_eq!(ev_b.judges_failed, 1);
+        assert!(ev_b.winner.is_some());
+
+        // Phase 2: one surviving candidate → singleton short-circuit → no
+        // judges run; winner is slot B's winner.
+        let ev_p2 = p2_event.expect("Phase 2 finished event");
+        assert_eq!(ev_p2.candidates, 1);
+        assert_eq!(ev_p2.judges_run, 0);
+        let p2_winner = ev_p2.winner.expect("Phase 2 winner");
+        assert_eq!(p2_winner.model_index, 1);
+        assert_eq!(p2_winner.content, "bravo");
+
+        // Canonical outcome still preserves every failed attempt and the
+        // failed judge — events do not replace canonical provenance.
+        let canonical_a = &outcome.phase_one[0];
+        assert_eq!(canonical_a.samples.len(), 2);
+        for sa in &canonical_a.samples {
+            match &sa.attempt.result {
+                Err(AgnosticCompletionError::ServerError { status, .. }) => {
+                    assert_eq!(*status, 503)
+                }
+                other => panic!("expected ServerError, got {other:?}"),
+            }
+        }
+        let canonical_b = &outcome.phase_one[1];
+        let j2_out = canonical_b
+            .judge_outcomes
+            .iter()
+            .find(|jo| jo.judge_label == "j2")
+            .expect("j2 outcome must be preserved");
+        assert!(matches!(
+            j2_out.result,
+            Err(JudgementError::Provider(AgnosticCompletionError::Auth { .. }))
+        ));
+    }
+
+    /// Singleton short-circuits: a slot with one sample, and a Phase 2
+    /// with one surviving slot, both emit events with `judges_run = 0`
+    /// because no judging actually happens. The events still arrive in
+    /// the expected sequence (Phase 1 slot then Phase 2 finished).
+    #[tokio::test]
+    async fn streaming_singleton_short_circuits_emit_clean_events() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "lone"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let client = OpenAiClient::new_with_base_url("k".to_string(), server.url());
+        let cmd = ok_command("p");
+
+        let slots = vec![ConsortiumSlot {
+            input: AiCompletionInputs::OpenAi(&client, &cmd),
+            model_label: "solo".to_string(),
+            samples: 1,
+        }];
+
+        // The judge would refuse to rank a singleton — but the singleton
+        // short-circuit means it never gets invoked.
+        let panicking = |_: JudgeRequest| -> Result<String, AgnosticCompletionError> {
+            panic!("judge must not be invoked under singleton short-circuit")
+        };
+        let j = FnJudge {
+            label: "j".to_string(),
+            f: panicking,
+        };
+        let judges: Vec<&dyn JudgeProvider> = vec![&j];
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PhaseEvent>();
+        let outcome = consortium_completion_streaming(&slots, &judges, tx).await;
+        let events = collect_events(rx).await;
+
+        assert_eq!(events.len(), 2, "1 Phase 1 + 1 Phase 2");
+
+        match &events[0] {
+            PhaseEvent::PhaseOneSlotFinished(e) => {
+                assert_eq!(e.slot_index, 0);
+                assert_eq!(e.model_label, "solo");
+                assert_eq!(e.total_samples, 1);
+                assert_eq!(e.successful_samples, 1);
+                assert_eq!(e.judges_run, 0, "singleton short-circuit skips judging");
+                assert!(e.winner.is_some());
+            }
+            other => panic!("expected PhaseOneSlotFinished first, got {other:?}"),
+        }
+        match &events[1] {
+            PhaseEvent::PhaseTwoFinished(e) => {
+                assert_eq!(e.candidates, 1);
+                assert_eq!(e.judges_run, 0, "Phase 2 singleton short-circuit");
+                let w = e.winner.as_ref().expect("Phase 2 singleton winner");
+                assert_eq!(w.content, "lone");
+                assert_eq!(w.model_label, "solo");
+            }
+            other => panic!("expected PhaseTwoFinished as final, got {other:?}"),
+        }
+
+        // Canonical outcome's singleton state matches.
+        assert_eq!(outcome.phase_one[0].judge_outcomes.len(), 0);
+        let p2 = outcome.phase_two.expect("phase 2 singleton");
+        assert!(p2.judge_outcomes.is_empty());
+        assert!(p2.winner.is_some());
+    }
+
+    /// End-to-end consortium test against real provider APIs. Gated behind
+    /// `#[ignore]` so `cargo test --lib` never depends on outbound network
+    /// calls or live keys. Run with `cargo test -- --ignored
+    /// real_api_consortium_completion` when all three of
+    /// `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` are set.
+    /// Skips cleanly (no panic, no assertion) when any key is missing so
+    /// the test can be left in place across environments.
+    ///
+    /// Verifies:
+    /// - The streaming surface emits exactly one Phase 1 event per slot
+    ///   plus one final Phase 2 event.
+    /// - The canonical [`ConsortiumOutcome`] eventually produces a
+    ///   Phase 2 winner across the three real providers.
+    /// - Events' counts agree with the canonical outcome's per-slot
+    ///   `samples` / `judge_outcomes` lengths.
+    #[tokio::test]
+    #[ignore = "live API integration; requires OPENAI_API_KEY + ANTHROPIC_API_KEY + GEMINI_API_KEY"]
+    async fn real_api_consortium_completion_emits_events_and_returns_canonical_outcome() {
+        use crate::{
+            ClaudeClient, ClaudeCompletionCommand, ClaudeMessage, ClaudeModel, ClaudeRole,
+            GeminiClient, GeminiCompletionCommand, GeminiMessage, GeminiModel, GeminiRole,
+        };
+
+        let openai_key = std::env::var("OPENAI_API_KEY").ok();
+        let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        let gemini_key = std::env::var("GEMINI_API_KEY").ok();
+        let (Some(_oa), Some(_an), Some(_ge)) = (&openai_key, &anthropic_key, &gemini_key)
+        else {
+            eprintln!("skipping: one or more provider keys missing");
+            return;
+        };
+
+        let openai_client = OpenAiClient::from_env().expect("OPENAI_API_KEY");
+        let claude_client = ClaudeClient::from_env().expect("ANTHROPIC_API_KEY");
+        let gemini_client = GeminiClient::from_env().expect("GEMINI_API_KEY");
+
+        let prompt = "In one short sentence, explain why airplanes can fly.";
+
+        let openai_cmd = OpenAiCompletionCommand {
+            model: OpenAiModel::Gpt4oMini,
+            system_prompt: None,
+            messages: vec![OpenAiMessage {
+                role: OpenAiRole::User,
+                content: prompt.to_string(),
+            }],
+            max_tokens: Some(80),
+            temperature: None,
+        };
+        let claude_cmd = ClaudeCompletionCommand {
+            model: ClaudeModel::Haiku45,
+            system_prompt: None,
+            messages: vec![ClaudeMessage {
+                role: ClaudeRole::User,
+                content: prompt.to_string(),
+            }],
+            max_tokens: 80,
+            temperature: None,
+        };
+        let gemini_cmd = GeminiCompletionCommand {
+            model: GeminiModel::Gemini15Flash,
+            system_prompt: None,
+            messages: vec![GeminiMessage {
+                role: GeminiRole::User,
+                content: prompt.to_string(),
+            }],
+            max_tokens: Some(80),
+            temperature: None,
+        };
+
+        let slots = vec![
+            ConsortiumSlot {
+                input: AiCompletionInputs::OpenAi(&openai_client, &openai_cmd),
+                model_label: "openai-gpt-4o-mini".to_string(),
+                samples: 1,
+            },
+            ConsortiumSlot {
+                input: AiCompletionInputs::Claude(&claude_client, &claude_cmd),
+                model_label: "anthropic-haiku-4-5".to_string(),
+                samples: 1,
+            },
+            ConsortiumSlot {
+                input: AiCompletionInputs::Gemini(&gemini_client, &gemini_cmd),
+                model_label: "gemini-1.5-flash".to_string(),
+                samples: 1,
+            },
+        ];
+
+        // The cheapest live judge: route the judge calls through the
+        // OpenAI client. Two judges so Phase 2 is a real ranking, not a
+        // singleton.
+        struct LiveOpenAiJudge {
+            label: String,
+            client: OpenAiClient,
+        }
+        impl JudgeProvider for LiveOpenAiJudge {
+            fn label(&self) -> &str {
+                &self.label
+            }
+            fn invoke<'a>(
+                &'a self,
+                request: JudgeRequest,
+            ) -> BoxFuture<'a, Result<String, AgnosticCompletionError>> {
+                let cmd = OpenAiCompletionCommand {
+                    model: OpenAiModel::Gpt4oMini,
+                    system_prompt: Some(request.system_prompt.to_string()),
+                    messages: vec![OpenAiMessage {
+                        role: OpenAiRole::User,
+                        content: request.user_message,
+                    }],
+                    max_tokens: Some(400),
+                    temperature: Some(0.0),
+                };
+                let client = self.client.clone();
+                Box::pin(async move {
+                    let inputs = [AiCompletionInputs::OpenAi(&client, &cmd)];
+                    let multi = MultiAiCompletionInputs::new(&inputs);
+                    let attempts = multi_infer(&multi).await;
+                    let attempt = attempts.into_iter().next().expect("one attempt");
+                    let output = attempt.result?;
+                    let text = output
+                        .chunks
+                        .into_iter()
+                        .filter_map(|c| match c {
+                            CompletionOutputChunk::Text(t) => Some(t),
+                            CompletionOutputChunk::Image(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Ok(text)
+                })
+            }
+        }
+        let j1 = LiveOpenAiJudge {
+            label: "judge-1".to_string(),
+            client: openai_client.clone(),
+        };
+        let j2 = LiveOpenAiJudge {
+            label: "judge-2".to_string(),
+            client: openai_client.clone(),
+        };
+        let judges: Vec<&dyn JudgeProvider> = vec![&j1, &j2];
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PhaseEvent>();
+        let outcome = consortium_completion_streaming(&slots, &judges, tx).await;
+        let events = collect_events(rx).await;
+
+        // 3 Phase 1 events + 1 Phase 2 event.
+        let phase_one_event_count = events
+            .iter()
+            .filter(|e| matches!(e, PhaseEvent::PhaseOneSlotFinished(_)))
+            .count();
+        let phase_two_event_count = events
+            .iter()
+            .filter(|e| matches!(e, PhaseEvent::PhaseTwoFinished(_)))
+            .count();
+        assert_eq!(phase_one_event_count, 3);
+        assert_eq!(phase_two_event_count, 1);
+
+        // Canonical outcome must produce a final winner.
+        let phase_two = outcome
+            .phase_two
+            .as_ref()
+            .expect("phase 2 should be Some when slots produced winners");
+        assert!(
+            phase_two.winner.is_some(),
+            "real-API run should produce a Phase 2 winner across the three providers"
+        );
+
+        // Each Phase 1 event's sample/judge counts agree with the
+        // canonical outcome (no event lies about what happened).
+        for ev in &events {
+            if let PhaseEvent::PhaseOneSlotFinished(e) = ev {
+                let canonical = &outcome.phase_one[e.slot_index];
+                assert_eq!(e.total_samples, canonical.samples.len());
+                assert_eq!(e.judges_run, canonical.judge_outcomes.len());
+            }
+        }
     }
 }

@@ -44,8 +44,9 @@ pub use crate::judge::{
 };
 pub use crate::orchestrator::{
     ConsortiumOutcome, ConsortiumSlot, CrossModelCandidate, CrossModelPhaseOutcome,
-    JudgeOutcome, JudgeProvider, JudgedSample, ModelPhaseOutcome, PhaseOneWinner,
-    PhaseTwoWinner, SampleAttempt, consortium_completion,
+    JudgeOutcome, JudgeProvider, JudgedSample, ModelPhaseOutcome, PhaseEvent,
+    PhaseOneSlotEvent, PhaseOneWinner, PhaseTwoFinishedEvent, PhaseTwoWinner, SampleAttempt,
+    consortium_completion, consortium_completion_streaming,
 };
 pub use crate::dataset::{
     DatasetBuildError, DatasetBuilder, DatasetRow, DatasetRun, DatasetRunError, PromptOutcome,
