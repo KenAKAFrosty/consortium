@@ -38,4 +38,5 @@ Use it to capture meaningful directions, experiments, decisions, and course corr
 - [Gemini Seed And Extraction Checkpoint](./journal/2026-05-15-gemini-seed-and-extraction-checkpoint.md)
 - [Stabilization: Secrets, Backon, And Constructor Shape](./journal/2026-05-15-stabilization-secrets-and-backon.md)
 - [M3 Multi-Provider Embedding Direction](./journal/2026-05-15-m3-multi-provider-embedding.md)
+- [M4 Judge Layer Corrections](./journal/2026-05-15-m4-judge-layer.md)
 - [Decision 0001: Owned Types At Async Boundaries](./decisions/0001-owned-types-at-async-boundaries.md)

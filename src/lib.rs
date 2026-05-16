@@ -1,6 +1,7 @@
 mod ai_client_apis;
 pub mod diversification;
 pub mod embeddings;
+pub mod judge;
 
 use std::time::{Duration, Instant};
 
@@ -34,6 +35,11 @@ pub use crate::embeddings::{
     AgnosticEmbeddingError, Embedder, EmbeddingBatch, EmbeddingProvider, EmbeddingUsage,
 };
 pub use crate::diversification::{SelectionStrategy, StopCondition, select_diverse};
+pub use crate::judge::{
+    AggregatedRanking, BlindCandidate, BlindId, Candidate, JUDGE_SYSTEM_PROMPT, JudgeRequest,
+    JudgementError, JudgementParseError, OrderedJudgement, aggregate_rankings,
+    assign_blind_ids, build_judge_user_message, judge_rank, parse_ordered_judgement,
+};
 
 #[derive(Clone, Copy)]
 pub enum AiCompletionInputs<'a> {
@@ -701,53 +707,7 @@ mod tests {
     }
 }
 
-//this is the higher level api and crate namesake. should feel like any other completion. does not need to conform to OpenAI spec; though it's probably smart to create a serde Deserialize struct to represent the OpenAPI spec, and create a conversion from/into  to make it super smooth to use this with said OpenAPI spec from the outside.
-pub fn consortium_completion() {
-
-    //this is where we'll have like PHase 1: intra-model consotrium output.
-    //then phase 2: inter-model consortium output, using best-of for each model from phase 1
-    //final output completion, though we'll want to maintain and return the others along the way, or provide callbacks/hooks to do somehting with them when theyr'e generated at least
-}
-
-const ORDERED_JUDGEMENT_SYSTEM_PROMPT: &'static str = r#"
-WIP/TODO: Set up system prompt.
-
-judge output based on the provided instructions + inputs given
-
-give reasoning first,
-
-xml style tag format, etc.
-"#;
-
-// #[derive(Deserialize)]
-pub struct OrderedJudgementStructuredData {
-    //this can be where we have the corresponding IDs in order, something like
-    ordered_ids: Vec<String>,
-}
-
-pub enum SortableJudgementProvider {
-    OpenAi,
-    Claude,
-    Gemini,
-}
-
-pub enum AiCompletionCommand {
-    OpenAi(OpenAiCompletionCommand),
-    Claude(ClaudeCompletionCommand),
-    Gemini(GeminiCompletionCommand),
-}
-pub fn make_sortable_judgement_command(
-    provider: &SortableJudgementProvider,
-) -> AiCompletionCommand {
-    match provider {
-        SortableJudgementProvider::Claude => {
-            AiCompletionCommand::Claude(ClaudeCompletionCommand::default())
-        }
-        SortableJudgementProvider::Gemini => {
-            AiCompletionCommand::Gemini(GeminiCompletionCommand::default())
-        }
-        SortableJudgementProvider::OpenAi => {
-            AiCompletionCommand::OpenAi(OpenAiCompletionCommand::default())
-        }
-    }
-}
+// `consortium_completion` (the two-phase orchestrator promised by the crate's
+// namesake feature) is M5 work — see `lab/plans/2026-05-15-implementation-plan.md`.
+// M4 provides the judge primitives (`src/judge/`); M5 wires fan-out + judge into
+// the actual phase-1/phase-2 orchestration.

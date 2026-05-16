@@ -152,11 +152,23 @@ Tests:
 
 ### M4 — Judge Phase
 
-- Write the actual `ORDERED_JUDGEMENT_SYSTEM_PROMPT` (currently WIP at `src/lib.rs:164`): reasoning-first inside `<reasoning>` tags, then `<ranking>id1,id2,…</ranking>`.
-- `fn assign_blind_ids(candidates) -> (HashMap<BlindId, ProviderTag>, Vec<BlindCandidate>)` so judges never see source attribution.
-- `async fn judge_rank(candidates, judge_provider) -> OrderedJudgementStructuredData` — the struct is already declared at `src/lib.rs:175`. Implement an XML-tag parser for judge output.
-- `fn aggregate_rankings(rankings: &[…]) -> Vec<BlindId>` — start with Borda count, leave the door open for Copeland/mean-rank later.
-- **Verify:** unit tests parse hand-written judge XML strings and aggregate to known winners.
+**Direction corrections (recorded 2026-05-15 before coding):** the original M4 outline had a real architectural bug — `HashMap<BlindId, ProviderTag>` collapses candidates to provider identity, which doesn't survive M5 phase-1 where multiple candidates from the same provider get judged together. The plan is corrected to map blind ids to **candidate identity** (specifically: candidate index in the original slice), and to make the parse contract typed and strict from day one. See [2026-05-15 — M4 Judge Layer Corrections](../journal/2026-05-15-m4-judge-layer.md).
+
+**M4a — Judge primitives (landed):** new module `src/judge/`.
+
+- `Candidate { content, provider: ProviderKind, model: String }` — what callers assemble after fan-out. Provider/model stay with the candidate but are never sent to the judge.
+- `BlindId(String)` — opaque, neutral, displays as `c1`, `c2`, etc.
+- `BlindCandidate { id, content }` — what the judge actually sees.
+- `assign_blind_ids(&[Candidate]) -> (Vec<BlindCandidate>, HashMap<BlindId, usize>)`. The `usize` is the candidate's index in the original slice, so the caller recovers full provenance — including which of two same-provider candidates was which — without leaking anything to the judge.
+- `JUDGE_SYSTEM_PROMPT` (`pub const`) locks the response shape: `<reasoning>...</reasoning>` then `<ranking>id1,id2,...</ranking>`. No ties. Every candidate exactly once. No text outside the blocks. Explicitly tells the judge it does not know the source model/provider. A test asserts the prompt does not mention any known provider name.
+- `build_judge_user_message(&[BlindCandidate]) -> String` formats candidates using their blind ids only.
+- `parse_ordered_judgement(raw, &HashSet<BlindId>) -> Result<OrderedJudgement, JudgementParseError>`. Tolerates whitespace around ids and inside the reasoning block. Strict on semantics: rejects missing tags, empty ranking, unknown ids, duplicate ids, and missing-from-expected ids. `OrderedJudgement` carries `ordered_ids`, `reasoning`, and `raw_response` (for audit).
+- `judge_rank(candidates, invoke_judge)` — `invoke_judge: FnOnce(JudgeRequest) -> Future<Output = Result<String, AgnosticCompletionError>>`. The closure-injected provider call keeps the judge layer provider-agnostic; the caller wires whichever real provider (or mock) as the judge. Provider errors propagate as `JudgementError::Provider`; parse failures as `JudgementError::Parse`.
+- `aggregate_rankings(&[OrderedJudgement]) -> AggregatedRanking { ordered_ids, scores }`. Borda count: i-th-place candidate in a length-N ranking earns `N - i` points; summed across judges; ordered by total desc. Tie-break: lexicographic on `BlindId` (deterministic; documented as `c10 < c2`).
+
+Removed from `src/lib.rs` as part of this slice: the M0-era `ORDERED_JUDGEMENT_SYSTEM_PROMPT` placeholder, `OrderedJudgementStructuredData`, `SortableJudgementProvider`, `AiCompletionCommand`, and `make_sortable_judgement_command`. All superseded by `src/judge/`.
+
+- **Verified:** 19 unit tests covering blind-id assignment + provenance, prompt + user-message provider-neutrality, parse success / whitespace tolerance / each typed parse error, `judge_rank` happy path + provider-error + parse-error propagation, Borda aggregation single / unanimous / disagreeing / tied / empty.
 
 ### M5 — Two-Phase Consortium
 

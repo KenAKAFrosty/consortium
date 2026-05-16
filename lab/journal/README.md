@@ -19,6 +19,7 @@ Journal entries are compact lab notes. They should record what was tried, what w
 - [2026-05-15 — Gemini Seed And Extraction Checkpoint](./2026-05-15-gemini-seed-and-extraction-checkpoint.md)
 - [2026-05-15 — Stabilization: Secrets, Backon, And Constructor Shape](./2026-05-15-stabilization-secrets-and-backon.md)
 - [2026-05-15 — M3 Multi-Provider Embedding Direction](./2026-05-15-m3-multi-provider-embedding.md)
+- [2026-05-15 — M4 Judge Layer Corrections](./2026-05-15-m4-judge-layer.md)
 
 ## See Also
 
