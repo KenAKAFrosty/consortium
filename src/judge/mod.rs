@@ -93,6 +93,8 @@ pub enum JudgementParseError {
     DuplicateId { id: String },
     #[error("ranking was missing blind ids: {missing:?}")]
     MissingIds { missing: Vec<String> },
+    #[error("judge response had non-whitespace text outside the required blocks: {snippet:?}")]
+    ExtraneousText { snippet: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -108,17 +110,52 @@ pub enum JudgementError {
 /// Whitespace around ids and inside the `<reasoning>` block is tolerated. The
 /// `<ranking>` block must contain exactly the same set of ids as `expected_ids`,
 /// each appearing exactly once. No duplicates. No unknowns. No empties.
+///
+/// The response must contain exactly two tagged blocks (`<reasoning>` then
+/// `<ranking>`) with nothing but whitespace outside them. Prefatory text,
+/// trailing chatter, or duplicate blocks are rejected as
+/// [`JudgementParseError::ExtraneousText`] — the prompt forbids out-of-block
+/// text, and accepting it would let judges silently break the contract.
 pub fn parse_ordered_judgement(
     raw_response: &str,
     expected_ids: &HashSet<BlindId>,
 ) -> Result<OrderedJudgement, JudgementParseError> {
-    let reasoning = extract_tag(raw_response, "reasoning")
-        .ok_or(JudgementParseError::MissingReasoningTag)?
+    let reasoning_span = locate_tag(raw_response, "reasoning")
+        .ok_or(JudgementParseError::MissingReasoningTag)?;
+    let ranking_span =
+        locate_tag(raw_response, "ranking").ok_or(JudgementParseError::MissingRankingTag)?;
+
+    // Reasoning must come before ranking, and the blocks must not overlap. If
+    // either invariant fails, the duplicate / out-of-order block ends up in one
+    // of the "outside" regions checked below and surfaces as ExtraneousText.
+    let regions: [(usize, usize); 3] = [
+        (0, reasoning_span.open_start),
+        (reasoning_span.close_end, ranking_span.open_start),
+        (ranking_span.close_end, raw_response.len()),
+    ];
+    for (start, end) in regions {
+        if end < start {
+            // Blocks overlap or ranking precedes reasoning — express as
+            // extraneous text using the full slice from the earlier index.
+            let lo = start.min(end);
+            let hi = start.max(end);
+            return Err(JudgementParseError::ExtraneousText {
+                snippet: trimmed_snippet(&raw_response[lo..hi]),
+            });
+        }
+        let region = &raw_response[start..end];
+        if region.chars().any(|c| !c.is_whitespace()) {
+            return Err(JudgementParseError::ExtraneousText {
+                snippet: trimmed_snippet(region),
+            });
+        }
+    }
+
+    let reasoning = raw_response[reasoning_span.content_start..reasoning_span.content_end]
         .trim()
         .to_string();
-
     let ranking_block =
-        extract_tag(raw_response, "ranking").ok_or(JudgementParseError::MissingRankingTag)?;
+        &raw_response[ranking_span.content_start..ranking_span.content_end];
 
     let ids: Vec<String> = ranking_block
         .split(',')
@@ -243,7 +280,35 @@ pub struct AggregatedRanking {
 /// post-process `AggregatedRanking.scores`.
 ///
 /// An empty input produces an empty aggregation.
+///
+/// # Panics
+///
+/// Panics if `rankings` contains rankings over different blind-id sets. Every
+/// ranking must be over the same candidate universe — mixing rankings from
+/// different judging sessions silently combines scores across unrelated
+/// candidate pools, which is a programmer error at the call site (orchestrator
+/// passed mismatched inputs). The invariant is checked against `rankings[0]`.
 pub fn aggregate_rankings(rankings: &[OrderedJudgement]) -> AggregatedRanking {
+    if rankings.is_empty() {
+        return AggregatedRanking {
+            ordered_ids: Vec::new(),
+            scores: HashMap::new(),
+        };
+    }
+
+    let first_universe: HashSet<&BlindId> = rankings[0].ordered_ids.iter().collect();
+    for (i, ranking) in rankings.iter().enumerate().skip(1) {
+        let universe: HashSet<&BlindId> = ranking.ordered_ids.iter().collect();
+        if universe != first_universe {
+            let expected = sorted_id_strings(&first_universe);
+            let actual = sorted_id_strings(&universe);
+            panic!(
+                "aggregate_rankings: all rankings must be over the same blind-id set; \
+                 rankings[0] has {expected:?} but rankings[{i}] has {actual:?}"
+            );
+        }
+    }
+
     let mut scores: HashMap<BlindId, u32> = HashMap::new();
 
     for ranking in rankings {
@@ -264,13 +329,43 @@ pub fn aggregate_rankings(rankings: &[OrderedJudgement]) -> AggregatedRanking {
     }
 }
 
-fn extract_tag(haystack: &str, tag: &str) -> Option<String> {
+struct TagSpan {
+    open_start: usize,
+    content_start: usize,
+    content_end: usize,
+    close_end: usize,
+}
+
+fn locate_tag(haystack: &str, tag: &str) -> Option<TagSpan> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
-    let start = haystack.find(&open)?;
-    let content_start = start + open.len();
-    let end = haystack[content_start..].find(&close)?;
-    Some(haystack[content_start..content_start + end].to_string())
+    let open_start = haystack.find(&open)?;
+    let content_start = open_start + open.len();
+    let close_offset = haystack[content_start..].find(&close)?;
+    let content_end = content_start + close_offset;
+    let close_end = content_end + close.len();
+    Some(TagSpan {
+        open_start,
+        content_start,
+        content_end,
+        close_end,
+    })
+}
+
+fn sorted_id_strings(ids: &HashSet<&BlindId>) -> Vec<String> {
+    let mut v: Vec<&BlindId> = ids.iter().copied().collect();
+    v.sort();
+    v.into_iter().map(|id| id.as_str().to_string()).collect()
+}
+
+fn trimmed_snippet(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= 80 {
+        trimmed.to_string()
+    } else {
+        let truncated: String = trimmed.chars().take(80).collect();
+        format!("{truncated}…")
+    }
 }
 
 #[cfg(test)]
@@ -417,6 +512,70 @@ mod tests {
             JudgementParseError::DuplicateId { id } => assert_eq!(id, "c1"),
             other => panic!("expected DuplicateId, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_rejects_prefatory_text() {
+        let raw = "Sure! Here is my judgment.\n<reasoning>x</reasoning><ranking>c1,c2</ranking>";
+        let err = parse_ordered_judgement(raw, &expected(&["c1", "c2"])).expect_err("prefatory");
+        match err {
+            JudgementParseError::ExtraneousText { snippet } => {
+                assert!(snippet.contains("Sure"), "snippet was: {snippet}");
+            }
+            other => panic!("expected ExtraneousText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_trailing_text() {
+        let raw = "<reasoning>x</reasoning><ranking>c1,c2</ranking>\nDone!";
+        let err = parse_ordered_judgement(raw, &expected(&["c1", "c2"])).expect_err("trailing");
+        match err {
+            JudgementParseError::ExtraneousText { snippet } => {
+                assert!(snippet.contains("Done"), "snippet was: {snippet}");
+            }
+            other => panic!("expected ExtraneousText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_text_between_blocks() {
+        let raw = "<reasoning>x</reasoning>then<ranking>c1,c2</ranking>";
+        let err = parse_ordered_judgement(raw, &expected(&["c1", "c2"])).expect_err("between");
+        match err {
+            JudgementParseError::ExtraneousText { snippet } => {
+                assert!(snippet.contains("then"), "snippet was: {snippet}");
+            }
+            other => panic!("expected ExtraneousText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_ranking_block() {
+        // A second <ranking> block ends up in the post-first-ranking outside region.
+        let raw = "<reasoning>x</reasoning><ranking>c1,c2</ranking><ranking>c2,c1</ranking>";
+        let err = parse_ordered_judgement(raw, &expected(&["c1", "c2"])).expect_err("duplicate");
+        assert!(matches!(err, JudgementParseError::ExtraneousText { .. }));
+    }
+
+    #[test]
+    fn parse_rejects_ranking_before_reasoning() {
+        // The ranking block ends up in the "before reasoning" outside region.
+        let raw = "<ranking>c1,c2</ranking><reasoning>x</reasoning>";
+        let err =
+            parse_ordered_judgement(raw, &expected(&["c1", "c2"])).expect_err("out of order");
+        assert!(matches!(err, JudgementParseError::ExtraneousText { .. }));
+    }
+
+    #[test]
+    fn parse_allows_whitespace_around_blocks() {
+        let raw = "\n\n<reasoning>x</reasoning>\n\n<ranking>c1,c2</ranking>\n";
+        let result =
+            parse_ordered_judgement(raw, &expected(&["c1", "c2"])).expect("whitespace ok");
+        assert_eq!(
+            result.ordered_ids,
+            vec![BlindId::new("c1"), BlindId::new("c2")]
+        );
     }
 
     #[test]
@@ -582,5 +741,25 @@ mod tests {
         let agg = aggregate_rankings(&[]);
         assert!(agg.ordered_ids.is_empty());
         assert!(agg.scores.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "all rankings must be over the same blind-id set")]
+    fn aggregate_panics_on_inconsistent_blind_id_universe() {
+        let agg_input = [
+            ranking(&["c1", "c2", "c3"]),
+            ranking(&["c1", "c2", "c4"]), // c3 vs c4 — different universe
+        ];
+        let _ = aggregate_rankings(&agg_input);
+    }
+
+    #[test]
+    #[should_panic(expected = "all rankings must be over the same blind-id set")]
+    fn aggregate_panics_on_partial_overlap_universe() {
+        let agg_input = [
+            ranking(&["c1", "c2", "c3"]),
+            ranking(&["c1", "c2"]), // missing c3 — different universe
+        ];
+        let _ = aggregate_rankings(&agg_input);
     }
 }
