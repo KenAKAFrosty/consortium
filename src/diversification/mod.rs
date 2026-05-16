@@ -43,6 +43,14 @@ impl StopCondition {
 /// (the seed picks the first input). Subsequent indices depend on `strategy`.
 ///
 /// Empty input returns an empty selection.
+///
+/// # Panics
+///
+/// Panics if `embeddings` contains vectors of different lengths. All vectors must
+/// share the same dimension — this is an invariant of any well-formed embedding
+/// batch from a single model. Mixed dimensions indicate a programmer error at
+/// the call site (mixing batches from different providers/models, or a corrupted
+/// aggregation), not a runtime condition worth modeling as a typed error.
 pub fn select_diverse(
     embeddings: &[Vec<f32>],
     strategy: SelectionStrategy,
@@ -50,6 +58,17 @@ pub fn select_diverse(
 ) -> Vec<usize> {
     if embeddings.is_empty() {
         return Vec::new();
+    }
+
+    let dim = embeddings[0].len();
+    for (i, vec) in embeddings.iter().enumerate().skip(1) {
+        assert_eq!(
+            vec.len(),
+            dim,
+            "select_diverse: embeddings must share the same dimension; \
+             embeddings[0] has dim {dim} but embeddings[{i}] has dim {}",
+            vec.len()
+        );
     }
 
     let total = embeddings.len();
@@ -271,6 +290,20 @@ mod tests {
         assert!(
             selected.len() >= 2,
             "orthogonal vectors should not trip the 0.5 wire, got: {selected:?}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must share the same dimension")]
+    fn select_diverse_panics_on_mixed_dimensions() {
+        let embs = vec![
+            vec![1.0_f32, 0.0],
+            vec![0.0_f32, 1.0, 0.0],
+        ];
+        let _ = select_diverse(
+            &embs,
+            SelectionStrategy::Centroid,
+            StopCondition::with_max_n(2),
         );
     }
 

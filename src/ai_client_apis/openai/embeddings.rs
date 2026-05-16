@@ -150,6 +150,7 @@ struct WireResponse {
 
 #[derive(Deserialize)]
 struct WireDataEntry {
+    index: usize,
     embedding: Vec<f32>,
 }
 
@@ -206,22 +207,40 @@ async fn openai_embed_raw(
     let parsed: WireResponse =
         serde_json::from_slice(&bytes).map_err(OpenAiEmbeddingFailure::Deserialize)?;
 
-    if parsed.data.is_empty() {
-        return Err(OpenAiEmbeddingFailure::MalformedResponse {
-            reason: "response contained no embeddings".to_string(),
-        });
-    }
-    if parsed.data.len() != inputs.len() {
-        return Err(OpenAiEmbeddingFailure::MalformedResponse {
-            reason: format!(
-                "embedding count mismatch: requested {}, received {}",
-                inputs.len(),
-                parsed.data.len()
-            ),
-        });
+    // OpenAI's response is documented as same-order-as-inputs, but the API still
+    // returns an explicit `index` per entry. Honor it: reconstruct vectors by
+    // index so the agnostic contract `inputs[i] -> vectors[i]` holds even if a
+    // future API change reorders the response.
+    let n = inputs.len();
+    let mut slots: Vec<Option<Vec<f32>>> = (0..n).map(|_| None).collect();
+    for entry in parsed.data {
+        if entry.index >= n {
+            return Err(OpenAiEmbeddingFailure::MalformedResponse {
+                reason: format!(
+                    "response contained index {} but only {} inputs were sent",
+                    entry.index, n
+                ),
+            });
+        }
+        if slots[entry.index].is_some() {
+            return Err(OpenAiEmbeddingFailure::MalformedResponse {
+                reason: format!("response contained duplicate index {}", entry.index),
+            });
+        }
+        slots[entry.index] = Some(entry.embedding);
     }
 
-    let vectors: Vec<Vec<f32>> = parsed.data.into_iter().map(|d| d.embedding).collect();
+    let mut vectors = Vec::with_capacity(n);
+    for (i, slot) in slots.into_iter().enumerate() {
+        match slot {
+            Some(v) => vectors.push(v),
+            None => {
+                return Err(OpenAiEmbeddingFailure::MalformedResponse {
+                    reason: format!("response missing index {}", i),
+                });
+            }
+        }
+    }
 
     Ok(EmbeddingBatch {
         vectors,
@@ -440,7 +459,134 @@ mod tests {
         let err = embedder.embed(&sample_inputs()).await.expect_err("malformed");
         match err {
             AgnosticEmbeddingError::MalformedResponse { reason, .. } => {
-                assert!(reason.contains("no embeddings"), "got: {reason}");
+                assert!(reason.contains("missing index 0"), "got: {reason}");
+            }
+            other => panic!("expected MalformedResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn out_of_order_data_is_reconstructed_by_index() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/embeddings")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "object": "list",
+                    "data": [
+                        {"object": "embedding", "index": 2, "embedding": [0.5, 0.6]},
+                        {"object": "embedding", "index": 0, "embedding": [0.1, 0.2]},
+                        {"object": "embedding", "index": 1, "embedding": [0.3, 0.4]}
+                    ],
+                    "model": "text-embedding-3-small",
+                    "usage": {"prompt_tokens": 6, "total_tokens": 6}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let embedder =
+            OpenAiEmbedder::new_with_base_url("test-key".to_string(), server.url());
+        let inputs = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let batch = embedder.embed(&inputs).await.expect("embed");
+
+        assert_eq!(batch.vectors.len(), 3);
+        assert_eq!(batch.vectors[0], vec![0.1, 0.2]);
+        assert_eq!(batch.vectors[1], vec![0.3, 0.4]);
+        assert_eq!(batch.vectors[2], vec![0.5, 0.6]);
+    }
+
+    #[tokio::test]
+    async fn out_of_range_index_maps_to_malformed_response() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/embeddings")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "object": "list",
+                    "data": [
+                        {"object": "embedding", "index": 0, "embedding": [0.1, 0.2]},
+                        {"object": "embedding", "index": 5, "embedding": [0.3, 0.4]}
+                    ],
+                    "model": "text-embedding-3-small",
+                    "usage": {"prompt_tokens": 4, "total_tokens": 4}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let embedder =
+            OpenAiEmbedder::new_with_base_url("test-key".to_string(), server.url());
+        let err = embedder.embed(&sample_inputs()).await.expect_err("out of range");
+        match err {
+            AgnosticEmbeddingError::MalformedResponse { reason, .. } => {
+                assert!(
+                    reason.contains("index 5") && reason.contains("2 inputs"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected MalformedResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_index_maps_to_malformed_response() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/embeddings")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "object": "list",
+                    "data": [
+                        {"object": "embedding", "index": 0, "embedding": [0.1, 0.2]},
+                        {"object": "embedding", "index": 0, "embedding": [0.3, 0.4]}
+                    ],
+                    "model": "text-embedding-3-small",
+                    "usage": {"prompt_tokens": 4, "total_tokens": 4}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let embedder =
+            OpenAiEmbedder::new_with_base_url("test-key".to_string(), server.url());
+        let err = embedder.embed(&sample_inputs()).await.expect_err("duplicate");
+        match err {
+            AgnosticEmbeddingError::MalformedResponse { reason, .. } => {
+                assert!(reason.contains("duplicate index 0"), "got: {reason}");
+            }
+            other => panic!("expected MalformedResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_non_zero_index_maps_to_malformed_response() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/embeddings")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "object": "list",
+                    "data": [
+                        {"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}
+                    ],
+                    "model": "text-embedding-3-small",
+                    "usage": {"prompt_tokens": 2, "total_tokens": 2}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let embedder =
+            OpenAiEmbedder::new_with_base_url("test-key".to_string(), server.url());
+        let err = embedder.embed(&sample_inputs()).await.expect_err("missing");
+        match err {
+            AgnosticEmbeddingError::MalformedResponse { reason, .. } => {
+                assert!(reason.contains("missing index 1"), "got: {reason}");
             }
             other => panic!("expected MalformedResponse, got {other:?}"),
         }
