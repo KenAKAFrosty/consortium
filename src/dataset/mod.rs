@@ -806,6 +806,10 @@ fn provider_str(p: ProviderKind) -> &'static str {
         ProviderKind::OpenAi => "openai",
         ProviderKind::Claude => "claude",
         ProviderKind::Gemini => "gemini",
+        ProviderKind::KimiK2 => "kimik2",
+        ProviderKind::Deepseek => "deepseek",
+        ProviderKind::Qwen => "qwen",
+        ProviderKind::Llama => "llama",
     }
 }
 

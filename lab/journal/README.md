@@ -27,6 +27,7 @@ Journal entries are compact lab notes. They should record what was tried, what w
 - [2026-05-16 — M5b Parallel Judge Fan-Out](./2026-05-16-m5b-parallel-judge-fanout.md)
 - [2026-05-16 — M5c Streaming PhaseEvent Surface](./2026-05-16-m5c-streaming-phase-events.md)
 - [2026-05-16 — Embedder Mixed-Dimension Hardening](./2026-05-16-embedder-mixed-dimension-hardening.md)
+- [2026-05-16 — M7 Remaining Provider Clients](./2026-05-16-m7-remaining-providers.md)
 
 ## See Also
 

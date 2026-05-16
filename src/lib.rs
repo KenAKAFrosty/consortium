@@ -12,19 +12,35 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 
-use crate::ai_client_apis::{claude::*, gemini::*, openai::*};
+use crate::ai_client_apis::{
+    claude::*, deepseek::*, gemini::*, kimik2::*, llama::*, openai::*, qwen::*,
+};
 
 pub use crate::ai_client_apis::claude::{
     ClaudeClient, ClaudeClientError, ClaudeCompletionCommand, ClaudeMessage, ClaudeModel,
     ClaudeRole,
 };
+pub use crate::ai_client_apis::deepseek::{
+    DeepseekClient, DeepseekClientError, DeepseekCompletionCommand, DeepseekMessage, DeepseekModel,
+    DeepseekRole,
+};
 pub use crate::ai_client_apis::gemini::{
     GeminiClient, GeminiClientError, GeminiCompletionCommand, GeminiMessage, GeminiModel,
     GeminiRole,
 };
+pub use crate::ai_client_apis::kimik2::{
+    KimiK2Client, KimiK2ClientError, KimiK2CompletionCommand, KimiK2Message, KimiK2Model,
+    KimiK2Role,
+};
+pub use crate::ai_client_apis::llama::{
+    LlamaClient, LlamaClientError, LlamaCompletionCommand, LlamaMessage, LlamaModel, LlamaRole,
+};
 pub use crate::ai_client_apis::openai::{
     OpenAiClient, OpenAiClientError, OpenAiCompletionCommand, OpenAiMessage, OpenAiModel,
     OpenAiRole,
+};
+pub use crate::ai_client_apis::qwen::{
+    QwenClient, QwenClientError, QwenCompletionCommand, QwenMessage, QwenModel, QwenRole,
 };
 
 pub use crate::ai_client_apis::cohere::embeddings::{
@@ -58,10 +74,10 @@ pub enum AiCompletionInputs<'a> {
     Gemini(&'a GeminiClient, &'a GeminiCompletionCommand),
     OpenAi(&'a OpenAiClient, &'a OpenAiCompletionCommand),
     Claude(&'a ClaudeClient, &'a ClaudeCompletionCommand),
-    // KimiK2(&'a KimiK2Client, &'a KimiK2CompletionCommand),
-    // Deepseek(&'a DeepseekClient, &'a DeepseekCompletionCommand),
-    // Qwen(&'a QwenClient, &'a QwenCompletionCommand),
-    // Llama(&'a LlamaClient, &'a LlamaCompletionCommand),
+    KimiK2(&'a KimiK2Client, &'a KimiK2CompletionCommand),
+    Deepseek(&'a DeepseekClient, &'a DeepseekCompletionCommand),
+    Qwen(&'a QwenClient, &'a QwenCompletionCommand),
+    Llama(&'a LlamaClient, &'a LlamaCompletionCommand),
 }
 
 pub struct MultiAiCompletionInputs<'a> {
@@ -82,6 +98,10 @@ impl<'a> AiCompletionInputs<'a> {
             AiCompletionInputs::Claude(_, _) => ProviderKind::Claude,
             AiCompletionInputs::OpenAi(_, _) => ProviderKind::OpenAi,
             AiCompletionInputs::Gemini(_, _) => ProviderKind::Gemini,
+            AiCompletionInputs::KimiK2(_, _) => ProviderKind::KimiK2,
+            AiCompletionInputs::Deepseek(_, _) => ProviderKind::Deepseek,
+            AiCompletionInputs::Qwen(_, _) => ProviderKind::Qwen,
+            AiCompletionInputs::Llama(_, _) => ProviderKind::Llama,
         }
     }
 }
@@ -91,10 +111,10 @@ enum RawAiCompletionResult {
     Gemini(GeminiResult),
     OpenAi(OpenAiResult),
     Claude(ClaudeResult),
-    // KimiK2(KimiK2Result),
-    // Deepseek(DeepseekResult),
-    // Qwen(QwenResult),
-    // Llama(LlamaResult),
+    KimiK2(KimiK2Result),
+    Deepseek(DeepseekResult),
+    Qwen(QwenResult),
+    Llama(LlamaResult),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -102,6 +122,10 @@ pub enum ProviderKind {
     Claude,
     OpenAi,
     Gemini,
+    KimiK2,
+    Deepseek,
+    Qwen,
+    Llama,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -313,6 +337,134 @@ fn openai_failure_to_agnostic(
     }
 }
 
+fn kimik2_failure_to_agnostic(
+    failure: crate::ai_client_apis::kimik2::KimiK2CompletionFailure,
+) -> AgnosticCompletionError {
+    use crate::ai_client_apis::kimik2::KimiK2CompletionFailure as F;
+    let provider = ProviderKind::KimiK2;
+    match failure {
+        F::Transport(source) => AgnosticCompletionError::Transport { provider, source },
+        F::Deserialize(source) => AgnosticCompletionError::Deserialize { provider, source },
+        F::Auth { message } => AgnosticCompletionError::Auth { provider, message },
+        F::RateLimited {
+            retry_after,
+            message,
+        } => AgnosticCompletionError::RateLimited {
+            provider,
+            retry_after,
+            message,
+        },
+        F::InvalidRequest { message } => AgnosticCompletionError::InvalidRequest {
+            provider,
+            message,
+        },
+        F::ServerError { status, message } => AgnosticCompletionError::ServerError {
+            provider,
+            status,
+            message,
+        },
+        F::MalformedResponse { reason } => {
+            AgnosticCompletionError::MalformedResponse { provider, reason }
+        }
+    }
+}
+
+fn deepseek_failure_to_agnostic(
+    failure: crate::ai_client_apis::deepseek::DeepseekCompletionFailure,
+) -> AgnosticCompletionError {
+    use crate::ai_client_apis::deepseek::DeepseekCompletionFailure as F;
+    let provider = ProviderKind::Deepseek;
+    match failure {
+        F::Transport(source) => AgnosticCompletionError::Transport { provider, source },
+        F::Deserialize(source) => AgnosticCompletionError::Deserialize { provider, source },
+        F::Auth { message } => AgnosticCompletionError::Auth { provider, message },
+        F::RateLimited {
+            retry_after,
+            message,
+        } => AgnosticCompletionError::RateLimited {
+            provider,
+            retry_after,
+            message,
+        },
+        F::InvalidRequest { message } => AgnosticCompletionError::InvalidRequest {
+            provider,
+            message,
+        },
+        F::ServerError { status, message } => AgnosticCompletionError::ServerError {
+            provider,
+            status,
+            message,
+        },
+        F::MalformedResponse { reason } => {
+            AgnosticCompletionError::MalformedResponse { provider, reason }
+        }
+    }
+}
+
+fn qwen_failure_to_agnostic(
+    failure: crate::ai_client_apis::qwen::QwenCompletionFailure,
+) -> AgnosticCompletionError {
+    use crate::ai_client_apis::qwen::QwenCompletionFailure as F;
+    let provider = ProviderKind::Qwen;
+    match failure {
+        F::Transport(source) => AgnosticCompletionError::Transport { provider, source },
+        F::Deserialize(source) => AgnosticCompletionError::Deserialize { provider, source },
+        F::Auth { message } => AgnosticCompletionError::Auth { provider, message },
+        F::RateLimited {
+            retry_after,
+            message,
+        } => AgnosticCompletionError::RateLimited {
+            provider,
+            retry_after,
+            message,
+        },
+        F::InvalidRequest { message } => AgnosticCompletionError::InvalidRequest {
+            provider,
+            message,
+        },
+        F::ServerError { status, message } => AgnosticCompletionError::ServerError {
+            provider,
+            status,
+            message,
+        },
+        F::MalformedResponse { reason } => {
+            AgnosticCompletionError::MalformedResponse { provider, reason }
+        }
+    }
+}
+
+fn llama_failure_to_agnostic(
+    failure: crate::ai_client_apis::llama::LlamaCompletionFailure,
+) -> AgnosticCompletionError {
+    use crate::ai_client_apis::llama::LlamaCompletionFailure as F;
+    let provider = ProviderKind::Llama;
+    match failure {
+        F::Transport(source) => AgnosticCompletionError::Transport { provider, source },
+        F::Deserialize(source) => AgnosticCompletionError::Deserialize { provider, source },
+        F::Auth { message } => AgnosticCompletionError::Auth { provider, message },
+        F::RateLimited {
+            retry_after,
+            message,
+        } => AgnosticCompletionError::RateLimited {
+            provider,
+            retry_after,
+            message,
+        },
+        F::InvalidRequest { message } => AgnosticCompletionError::InvalidRequest {
+            provider,
+            message,
+        },
+        F::ServerError { status, message } => AgnosticCompletionError::ServerError {
+            provider,
+            status,
+            message,
+        },
+        F::MalformedResponse { reason } => {
+            AgnosticCompletionError::MalformedResponse { provider, reason }
+        }
+    }
+}
+
 fn convert_raw_result_to_agnostic_output(
     raw_result: RawAiCompletionResult,
 ) -> Result<AgnosticCompletionOutput, AgnosticCompletionError> {
@@ -346,6 +498,46 @@ fn convert_raw_result_to_agnostic_output(
                 },
             }),
             Err(failure) => Err(gemini_failure_to_agnostic(failure)),
+        },
+        RawAiCompletionResult::KimiK2(result) => match result {
+            Ok(success) => Ok(AgnosticCompletionOutput {
+                chunks: vec![CompletionOutputChunk::Text(success.content)],
+                tokens_used: CompletionOutputTokensUsed {
+                    input: success.prompt_tokens,
+                    output: success.completion_tokens,
+                },
+            }),
+            Err(failure) => Err(kimik2_failure_to_agnostic(failure)),
+        },
+        RawAiCompletionResult::Deepseek(result) => match result {
+            Ok(success) => Ok(AgnosticCompletionOutput {
+                chunks: vec![CompletionOutputChunk::Text(success.content)],
+                tokens_used: CompletionOutputTokensUsed {
+                    input: success.prompt_tokens,
+                    output: success.completion_tokens,
+                },
+            }),
+            Err(failure) => Err(deepseek_failure_to_agnostic(failure)),
+        },
+        RawAiCompletionResult::Qwen(result) => match result {
+            Ok(success) => Ok(AgnosticCompletionOutput {
+                chunks: vec![CompletionOutputChunk::Text(success.content)],
+                tokens_used: CompletionOutputTokensUsed {
+                    input: success.prompt_tokens,
+                    output: success.completion_tokens,
+                },
+            }),
+            Err(failure) => Err(qwen_failure_to_agnostic(failure)),
+        },
+        RawAiCompletionResult::Llama(result) => match result {
+            Ok(success) => Ok(AgnosticCompletionOutput {
+                chunks: vec![CompletionOutputChunk::Text(success.content)],
+                tokens_used: CompletionOutputTokensUsed {
+                    input: success.prompt_tokens,
+                    output: success.completion_tokens,
+                },
+            }),
+            Err(failure) => Err(llama_failure_to_agnostic(failure)),
         },
     }
 }
@@ -440,6 +632,38 @@ pub async fn multi_infer<'a>(inputs: &'a MultiAiCompletionInputs<'a>) -> Vec<Pro
                     convert_raw_result_to_agnostic_output(RawAiCompletionResult::Gemini(raw))
                 },
             ),
+            AiCompletionInputs::KimiK2(client, command) => build_attempt(
+                ProviderKind::KimiK2,
+                input_index,
+                move || async move {
+                    let raw = kimik2_get_completion(client, command).await;
+                    convert_raw_result_to_agnostic_output(RawAiCompletionResult::KimiK2(raw))
+                },
+            ),
+            AiCompletionInputs::Deepseek(client, command) => build_attempt(
+                ProviderKind::Deepseek,
+                input_index,
+                move || async move {
+                    let raw = deepseek_get_completion(client, command).await;
+                    convert_raw_result_to_agnostic_output(RawAiCompletionResult::Deepseek(raw))
+                },
+            ),
+            AiCompletionInputs::Qwen(client, command) => build_attempt(
+                ProviderKind::Qwen,
+                input_index,
+                move || async move {
+                    let raw = qwen_get_completion(client, command).await;
+                    convert_raw_result_to_agnostic_output(RawAiCompletionResult::Qwen(raw))
+                },
+            ),
+            AiCompletionInputs::Llama(client, command) => build_attempt(
+                ProviderKind::Llama,
+                input_index,
+                move || async move {
+                    let raw = llama_get_completion(client, command).await;
+                    convert_raw_result_to_agnostic_output(RawAiCompletionResult::Llama(raw))
+                },
+            ),
         };
         in_flight.push(attempt_future);
     }
@@ -455,9 +679,13 @@ pub async fn multi_infer<'a>(inputs: &'a MultiAiCompletionInputs<'a>) -> Vec<Pro
 mod tests {
     use crate::{
         AiCompletionInputs, ClaudeClient, ClaudeCompletionCommand, ClaudeMessage, ClaudeModel,
-        ClaudeRole, CompletionOutputChunk, GeminiClient, GeminiCompletionCommand, GeminiMessage,
-        GeminiModel, GeminiRole, MultiAiCompletionInputs, OpenAiClient, OpenAiCompletionCommand,
-        OpenAiMessage, OpenAiModel, OpenAiRole, ProviderKind,
+        ClaudeRole, CompletionOutputChunk, DeepseekClient, DeepseekCompletionCommand,
+        DeepseekMessage, DeepseekModel, DeepseekRole, GeminiClient, GeminiCompletionCommand,
+        GeminiMessage, GeminiModel, GeminiRole, KimiK2Client, KimiK2CompletionCommand,
+        KimiK2Message, KimiK2Model, KimiK2Role, LlamaClient, LlamaCompletionCommand, LlamaMessage,
+        LlamaModel, LlamaRole, MultiAiCompletionInputs, OpenAiClient, OpenAiCompletionCommand,
+        OpenAiMessage, OpenAiModel, OpenAiRole, ProviderKind, QwenClient, QwenCompletionCommand,
+        QwenMessage, QwenModel, QwenRole,
     };
 
     use super::multi_infer;
@@ -670,6 +898,198 @@ mod tests {
         }
         assert_eq!(output.tokens_used.input, 10);
         assert_eq!(output.tokens_used.output, 4);
+    }
+
+    #[tokio::test]
+    async fn multi_infer_deepseek_success_path_emits_real_text_and_tokens() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "deepseek fan-out works"}}],
+                    "usage": {"prompt_tokens": 11, "completion_tokens": 6}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let client = DeepseekClient::new_with_base_url("k".to_string(), server.url());
+        let command = DeepseekCompletionCommand {
+            model: DeepseekModel::Chat,
+            system_prompt: None,
+            messages: vec![DeepseekMessage {
+                role: DeepseekRole::User,
+                content: "go".to_string(),
+            }],
+            max_tokens: Some(16),
+            temperature: None,
+        };
+        let inputs = [AiCompletionInputs::Deepseek(&client, &command)];
+        let multi = MultiAiCompletionInputs::new(&inputs);
+
+        let attempts = multi_infer(&multi).await;
+        assert_eq!(attempts.len(), 1);
+        let attempt = &attempts[0];
+        assert_eq!(attempt.provider, ProviderKind::Deepseek);
+        assert_eq!(attempt.input_index, 0);
+
+        let output = attempt
+            .result
+            .as_ref()
+            .expect("Deepseek path must produce a real output");
+        match output.chunks.as_slice() {
+            [CompletionOutputChunk::Text(text)] => assert_eq!(text, "deepseek fan-out works"),
+            other => panic!("expected a single text chunk, got {other:?}"),
+        }
+        assert_eq!(output.tokens_used.input, 11);
+        assert_eq!(output.tokens_used.output, 6);
+    }
+
+    #[tokio::test]
+    async fn multi_infer_kimik2_success_path_emits_real_text_and_tokens() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "kimi fan-out works"}}],
+                    "usage": {"prompt_tokens": 8, "completion_tokens": 4}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let client = KimiK2Client::new_with_base_url("k".to_string(), server.url());
+        let command = KimiK2CompletionCommand {
+            model: KimiK2Model::KimiK20905Preview,
+            system_prompt: None,
+            messages: vec![KimiK2Message {
+                role: KimiK2Role::User,
+                content: "go".to_string(),
+            }],
+            max_tokens: Some(16),
+            temperature: None,
+        };
+        let inputs = [AiCompletionInputs::KimiK2(&client, &command)];
+        let multi = MultiAiCompletionInputs::new(&inputs);
+
+        let attempts = multi_infer(&multi).await;
+        assert_eq!(attempts.len(), 1);
+        let attempt = &attempts[0];
+        assert_eq!(attempt.provider, ProviderKind::KimiK2);
+        assert_eq!(attempt.input_index, 0);
+
+        let output = attempt
+            .result
+            .as_ref()
+            .expect("Kimi K2 path must produce a real output");
+        match output.chunks.as_slice() {
+            [CompletionOutputChunk::Text(text)] => assert_eq!(text, "kimi fan-out works"),
+            other => panic!("expected a single text chunk, got {other:?}"),
+        }
+        assert_eq!(output.tokens_used.input, 8);
+        assert_eq!(output.tokens_used.output, 4);
+    }
+
+    #[tokio::test]
+    async fn multi_infer_qwen_success_path_emits_real_text_and_tokens() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "qwen fan-out works"}}],
+                    "usage": {"prompt_tokens": 13, "completion_tokens": 5}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let client = QwenClient::new_with_base_url("k".to_string(), server.url());
+        let command = QwenCompletionCommand {
+            model: QwenModel::QwenTurbo,
+            system_prompt: None,
+            messages: vec![QwenMessage {
+                role: QwenRole::User,
+                content: "go".to_string(),
+            }],
+            max_tokens: Some(16),
+            temperature: None,
+        };
+        let inputs = [AiCompletionInputs::Qwen(&client, &command)];
+        let multi = MultiAiCompletionInputs::new(&inputs);
+
+        let attempts = multi_infer(&multi).await;
+        assert_eq!(attempts.len(), 1);
+        let attempt = &attempts[0];
+        assert_eq!(attempt.provider, ProviderKind::Qwen);
+        assert_eq!(attempt.input_index, 0);
+
+        let output = attempt
+            .result
+            .as_ref()
+            .expect("Qwen path must produce a real output");
+        match output.chunks.as_slice() {
+            [CompletionOutputChunk::Text(text)] => assert_eq!(text, "qwen fan-out works"),
+            other => panic!("expected a single text chunk, got {other:?}"),
+        }
+        assert_eq!(output.tokens_used.input, 13);
+        assert_eq!(output.tokens_used.output, 5);
+    }
+
+    #[tokio::test]
+    async fn multi_infer_llama_success_path_emits_real_text_and_tokens() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "llama fan-out works"}}],
+                    "usage": {"prompt_tokens": 14, "completion_tokens": 8}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let client = LlamaClient::new_with_base_url("k".to_string(), server.url());
+        let command = LlamaCompletionCommand {
+            model: LlamaModel::Llama3_3_70B,
+            system_prompt: None,
+            messages: vec![LlamaMessage {
+                role: LlamaRole::User,
+                content: "go".to_string(),
+            }],
+            max_tokens: Some(16),
+            temperature: None,
+        };
+        let inputs = [AiCompletionInputs::Llama(&client, &command)];
+        let multi = MultiAiCompletionInputs::new(&inputs);
+
+        let attempts = multi_infer(&multi).await;
+        assert_eq!(attempts.len(), 1);
+        let attempt = &attempts[0];
+        assert_eq!(attempt.provider, ProviderKind::Llama);
+        assert_eq!(attempt.input_index, 0);
+
+        let output = attempt
+            .result
+            .as_ref()
+            .expect("Llama path must produce a real output");
+        match output.chunks.as_slice() {
+            [CompletionOutputChunk::Text(text)] => assert_eq!(text, "llama fan-out works"),
+            other => panic!("expected a single text chunk, got {other:?}"),
+        }
+        assert_eq!(output.tokens_used.input, 14);
+        assert_eq!(output.tokens_used.output, 8);
     }
 
     #[tokio::test(start_paused = true)]
