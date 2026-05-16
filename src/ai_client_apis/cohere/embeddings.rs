@@ -209,6 +209,11 @@ impl Embedder for CohereEmbedder {
 /// allocation happens in the common case. A failing chunk short-circuits with
 /// its typed [`CohereEmbeddingFailure`]; vectors from earlier chunks are not
 /// returned partially.
+///
+/// Cross-chunk vector dimensions are also verified: each chunk is already
+/// intra-chunk-uniform (enforced inside [`cohere_embed_chunk`]), so this loop
+/// only needs to anchor on the first non-empty chunk's dimension and reject
+/// any later chunk whose first vector dimension differs.
 async fn cohere_embed_raw(
     embedder: &CohereEmbedder,
     inputs: &[String],
@@ -219,8 +224,23 @@ async fn cohere_embed_raw(
 
     let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
     let mut input_tokens: u64 = 0;
+    let mut expected_dim: Option<usize> = None;
     for chunk in inputs.chunks(MAX_INPUTS_PER_REQUEST) {
         let batch = cohere_embed_chunk(embedder, chunk).await?;
+        if let Some(first) = batch.vectors.first() {
+            let chunk_dim = first.len();
+            match expected_dim {
+                None => expected_dim = Some(chunk_dim),
+                Some(prev) if prev != chunk_dim => {
+                    return Err(CohereEmbeddingFailure::MalformedResponse {
+                        reason: format!(
+                            "chunk vector dimension {chunk_dim} differs from earlier chunk dimension {prev}"
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
         vectors.extend(batch.vectors);
         input_tokens = input_tokens.saturating_add(batch.usage.input_tokens);
     }
@@ -282,6 +302,23 @@ async fn cohere_embed_chunk(
                 parsed.embeddings.float.len()
             ),
         });
+    }
+
+    // Reject intra-chunk mixed-dimension responses early. The dataset layer's
+    // EmbeddingDimensionMismatch guard (src/dataset/mod.rs) is now a
+    // defensive backstop — the typed MalformedResponse surfaces here, with
+    // full provider provenance, before the agnostic Embedder boundary
+    // returns. The empty-vector path is guarded above, so vectors[0] exists.
+    let expected = parsed.embeddings.float[0].len();
+    for (i, v) in parsed.embeddings.float.iter().enumerate().skip(1) {
+        if v.len() != expected {
+            return Err(CohereEmbeddingFailure::MalformedResponse {
+                reason: format!(
+                    "vector at index {i} has dimension {} but vector at index 0 has dimension {expected}",
+                    v.len()
+                ),
+            });
+        }
     }
 
     let input_tokens = parsed
@@ -707,6 +744,122 @@ mod tests {
                 );
             }
             other => panic!("expected ServerError from second chunk, got {other:?}"),
+        }
+    }
+
+    /// A single chunk response with vectors of differing dimensions must
+    /// surface as [`AgnosticEmbeddingError::MalformedResponse`] inside the
+    /// embedder itself — *before* the dataset layer's
+    /// `EmbeddingDimensionMismatch` guard runs. This proves the dataset
+    /// guard is a defensive backstop rather than the primary path.
+    #[tokio::test]
+    async fn intra_chunk_mixed_dimension_response_maps_to_malformed_response() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v2/embed")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "id": "abc",
+                    "embeddings": {"float": [[0.1, 0.2, 0.3], [0.4, 0.5]]},
+                    "texts": ["alpha", "beta"],
+                    "meta": {"billed_units": {"input_tokens": 5}}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let embedder =
+            CohereEmbedder::new_with_base_url("test-key".to_string(), server.url());
+        let err = embedder
+            .embed(&sample_inputs())
+            .await
+            .expect_err("mixed-dimension response must surface as MalformedResponse");
+        match err {
+            AgnosticEmbeddingError::MalformedResponse { provider, reason } => {
+                assert_eq!(provider, crate::EmbeddingProvider::Cohere);
+                assert!(
+                    reason.contains("vector at index 1")
+                        && reason.contains("dimension 2")
+                        && reason.contains("dimension 3"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected MalformedResponse, got {other:?}"),
+        }
+    }
+
+    /// An auto-chunked batch whose later chunk returns vectors of a
+    /// different dimension than the first chunk must surface as
+    /// [`AgnosticEmbeddingError::MalformedResponse`] from the cross-chunk
+    /// check in [`cohere_embed_raw`]. Earlier vectors must not leak out as
+    /// a partial-success batch.
+    #[tokio::test]
+    async fn cross_chunk_dimension_drift_maps_to_malformed_response() {
+        let total = MAX_INPUTS_PER_REQUEST + 4;
+        let inputs = marker_inputs_for_two_chunks(
+            total,
+            MAX_INPUTS_PER_REQUEST,
+            "cohere-dim-drift-chunk-0-marker",
+            "cohere-dim-drift-chunk-1-marker",
+        );
+
+        // Chunk 0 returns vectors of dimension 2 (the standard build_*_chunk
+        // helper output). Chunk 1 returns a hand-built body whose four
+        // vectors are dimension 3 — uniform within the chunk, but
+        // inconsistent across chunks.
+        let chunk_0_body =
+            build_cohere_chunk_response_body(0, MAX_INPUTS_PER_REQUEST, 60);
+        let chunk_1_float: Vec<Vec<f32>> =
+            (0..4).map(|_| vec![9.0_f32, 9.0_f32, 9.0_f32]).collect();
+        let chunk_1_body = serde_json::json!({
+            "id": "test",
+            "embeddings": { "float": chunk_1_float },
+            "meta": { "billed_units": { "input_tokens": 10 } },
+        })
+        .to_string();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m0 = server
+            .mock("POST", "/v2/embed")
+            .match_body(mockito::Matcher::Regex(
+                "cohere-dim-drift-chunk-0-marker".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chunk_0_body)
+            .expect(1)
+            .create_async()
+            .await;
+        let _m1 = server
+            .mock("POST", "/v2/embed")
+            .match_body(mockito::Matcher::Regex(
+                "cohere-dim-drift-chunk-1-marker".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chunk_1_body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let embedder =
+            CohereEmbedder::new_with_base_url("test-key".to_string(), server.url());
+        let err = embedder
+            .embed(&inputs)
+            .await
+            .expect_err("cross-chunk dimension drift must surface as MalformedResponse");
+        match err {
+            AgnosticEmbeddingError::MalformedResponse { provider, reason } => {
+                assert_eq!(provider, crate::EmbeddingProvider::Cohere);
+                assert!(
+                    reason.contains("chunk vector dimension 3")
+                        && reason.contains("earlier chunk dimension 2"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected MalformedResponse, got {other:?}"),
         }
     }
 

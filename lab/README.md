@@ -45,4 +45,5 @@ Use it to capture meaningful directions, experiments, decisions, and course corr
 - [M6c Embedder Auto-Chunking](./journal/2026-05-16-m6c-embedder-auto-chunking.md)
 - [M5b Parallel Judge Fan-Out](./journal/2026-05-16-m5b-parallel-judge-fanout.md)
 - [M5c Streaming PhaseEvent Surface](./journal/2026-05-16-m5c-streaming-phase-events.md)
+- [Embedder Mixed-Dimension Hardening](./journal/2026-05-16-embedder-mixed-dimension-hardening.md)
 - [Decision 0001: Owned Types At Async Boundaries](./decisions/0001-owned-types-at-async-boundaries.md)

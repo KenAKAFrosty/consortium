@@ -182,6 +182,11 @@ impl Embedder for OpenAiEmbedder {
 /// allocation happens in the common case. A failing chunk short-circuits with
 /// its typed [`OpenAiEmbeddingFailure`]; vectors from earlier chunks are not
 /// returned partially.
+///
+/// Cross-chunk vector dimensions are also verified: each chunk is already
+/// intra-chunk-uniform (enforced inside [`openai_embed_chunk`]), so this loop
+/// only needs to anchor on the first non-empty chunk's dimension and reject
+/// any later chunk whose first vector dimension differs.
 async fn openai_embed_raw(
     embedder: &OpenAiEmbedder,
     inputs: &[String],
@@ -192,8 +197,23 @@ async fn openai_embed_raw(
 
     let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
     let mut input_tokens: u64 = 0;
+    let mut expected_dim: Option<usize> = None;
     for chunk in inputs.chunks(MAX_INPUTS_PER_REQUEST) {
         let batch = openai_embed_chunk(embedder, chunk).await?;
+        if let Some(first) = batch.vectors.first() {
+            let chunk_dim = first.len();
+            match expected_dim {
+                None => expected_dim = Some(chunk_dim),
+                Some(prev) if prev != chunk_dim => {
+                    return Err(OpenAiEmbeddingFailure::MalformedResponse {
+                        reason: format!(
+                            "chunk vector dimension {chunk_dim} differs from earlier chunk dimension {prev}"
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
         vectors.extend(batch.vectors);
         input_tokens = input_tokens.saturating_add(batch.usage.input_tokens);
     }
@@ -270,6 +290,25 @@ async fn openai_embed_chunk(
             None => {
                 return Err(OpenAiEmbeddingFailure::MalformedResponse {
                     reason: format!("response missing index {}", i),
+                });
+            }
+        }
+    }
+
+    // Reject intra-chunk mixed-dimension responses early. The dataset layer's
+    // EmbeddingDimensionMismatch guard (src/dataset/mod.rs) is now a
+    // defensive backstop — the typed MalformedResponse surfaces here, with
+    // full provider provenance, before the agnostic Embedder boundary
+    // returns.
+    if let Some(first) = vectors.first() {
+        let expected = first.len();
+        for (i, v) in vectors.iter().enumerate().skip(1) {
+            if v.len() != expected {
+                return Err(OpenAiEmbeddingFailure::MalformedResponse {
+                    reason: format!(
+                        "vector at index {i} has dimension {} but vector at index 0 has dimension {expected}",
+                        v.len()
+                    ),
                 });
             }
         }
@@ -792,6 +831,127 @@ mod tests {
                 assert_eq!(message.as_deref(), Some("Invalid API key on chunk 1"));
             }
             other => panic!("expected Auth from second chunk, got {other:?}"),
+        }
+    }
+
+    /// A single chunk response with vectors of differing dimensions must
+    /// surface as [`AgnosticEmbeddingError::MalformedResponse`] inside the
+    /// embedder itself — *before* the dataset layer's
+    /// `EmbeddingDimensionMismatch` guard runs. This proves the dataset
+    /// guard is a defensive backstop rather than the primary path.
+    #[tokio::test]
+    async fn intra_chunk_mixed_dimension_response_maps_to_malformed_response() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/embeddings")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "object": "list",
+                    "data": [
+                        {"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]},
+                        {"object": "embedding", "index": 1, "embedding": [0.4, 0.5]}
+                    ],
+                    "model": "text-embedding-3-small",
+                    "usage": {"prompt_tokens": 4, "total_tokens": 4}
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let embedder =
+            OpenAiEmbedder::new_with_base_url("test-key".to_string(), server.url());
+        let err = embedder
+            .embed(&sample_inputs())
+            .await
+            .expect_err("mixed-dimension response must surface as MalformedResponse");
+        match err {
+            AgnosticEmbeddingError::MalformedResponse { provider, reason } => {
+                assert_eq!(provider, crate::EmbeddingProvider::OpenAi);
+                assert!(
+                    reason.contains("vector at index 1")
+                        && reason.contains("dimension 2")
+                        && reason.contains("dimension 3"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected MalformedResponse, got {other:?}"),
+        }
+    }
+
+    /// An auto-chunked batch whose later chunk returns vectors of a
+    /// different dimension than the first chunk must surface as
+    /// [`AgnosticEmbeddingError::MalformedResponse`] from the cross-chunk
+    /// check in [`openai_embed_raw`]. Earlier vectors must not leak out as
+    /// a partial-success batch.
+    #[tokio::test]
+    async fn cross_chunk_dimension_drift_maps_to_malformed_response() {
+        let total = MAX_INPUTS_PER_REQUEST + 2;
+        let inputs = marker_inputs_for_two_chunks(
+            total,
+            MAX_INPUTS_PER_REQUEST,
+            "openai-dim-drift-chunk-0-marker",
+            "openai-dim-drift-chunk-1-marker",
+        );
+
+        // Chunk 0 returns vectors of dimension 2 (the standard build_*_chunk
+        // helper output). Chunk 1 returns a hand-built body whose two
+        // vectors are dimension 3 — uniform within the chunk, but
+        // inconsistent across chunks.
+        let chunk_0_body =
+            build_openai_chunk_response_body(0, MAX_INPUTS_PER_REQUEST, 100);
+        let chunk_1_body = serde_json::json!({
+            "object": "list",
+            "data": [
+                {"object": "embedding", "index": 0, "embedding": [9.0_f32, 9.0_f32, 9.0_f32]},
+                {"object": "embedding", "index": 1, "embedding": [9.0_f32, 9.0_f32, 9.0_f32]},
+            ],
+            "model": "text-embedding-3-small",
+            "usage": { "prompt_tokens": 50, "total_tokens": 50 },
+        })
+        .to_string();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m0 = server
+            .mock("POST", "/v1/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "openai-dim-drift-chunk-0-marker".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chunk_0_body)
+            .expect(1)
+            .create_async()
+            .await;
+        let _m1 = server
+            .mock("POST", "/v1/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "openai-dim-drift-chunk-1-marker".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chunk_1_body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let embedder =
+            OpenAiEmbedder::new_with_base_url("test-key".to_string(), server.url());
+        let err = embedder
+            .embed(&inputs)
+            .await
+            .expect_err("cross-chunk dimension drift must surface as MalformedResponse");
+        match err {
+            AgnosticEmbeddingError::MalformedResponse { provider, reason } => {
+                assert_eq!(provider, crate::EmbeddingProvider::OpenAi);
+                assert!(
+                    reason.contains("chunk vector dimension 3")
+                        && reason.contains("earlier chunk dimension 2"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected MalformedResponse, got {other:?}"),
         }
     }
 
