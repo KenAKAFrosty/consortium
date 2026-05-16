@@ -23,6 +23,7 @@ Journal entries are compact lab notes. They should record what was tried, what w
 - [2026-05-15 — M5a Two-Phase Consortium Orchestrator](./2026-05-15-m5a-two-phase-orchestrator.md)
 - [2026-05-15 — M6a Dataset Builder And JSONL Pipeline](./2026-05-15-m6a-dataset-builder-and-jsonl-pipeline.md)
 - [2026-05-16 — M6b Bounded Per-Prompt Parallelism](./2026-05-16-m6b-bounded-per-prompt-parallelism.md)
+- [2026-05-16 — M6c Embedder Auto-Chunking](./2026-05-16-m6c-embedder-auto-chunking.md)
 
 ## See Also
 

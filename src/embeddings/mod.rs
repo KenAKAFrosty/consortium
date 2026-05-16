@@ -84,13 +84,18 @@ pub struct EmbeddingBatch {
 
 /// Provider-agnostic embedding boundary.
 ///
-/// Implementations send the entire `inputs` slice in a single HTTP request.
-/// Callers must chunk before calling if their batch exceeds the provider's
-/// per-request input limit (OpenAI: 2048, Cohere v3: 96). Automatic chunking
-/// inside `embed` is deferred to a future slice.
-///
 /// `inputs[i]` corresponds to `vectors[i]` in the returned batch — order is
-/// preserved.
+/// preserved. An empty `inputs` slice is forwarded to the provider as-is;
+/// implementations do not pre-validate.
+///
+/// Implementations may issue one or more HTTP requests. The shipped
+/// [`crate::OpenAiEmbedder`] and [`crate::CohereEmbedder`] auto-chunk inputs
+/// at the provider's documented per-request limit (OpenAI: 2048, Cohere v3:
+/// 96), concatenate per-chunk results in input order, and sum per-chunk
+/// [`EmbeddingUsage`] into one aggregated total. If any chunk fails, the
+/// typed [`AgnosticEmbeddingError`] for that chunk is returned — there is no
+/// partial-success surface. Custom [`Embedder`] impls are free to issue a
+/// single request and reject over-limit inputs themselves.
 ///
 /// Native `async fn` in trait (Rust 2024). Static dispatch only; `dyn Embedder`
 /// is not supported.

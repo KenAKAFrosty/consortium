@@ -141,14 +141,14 @@ Defaults:
 - Cohere: `embed-english-v3.0` + `search_document` input type. **Not** `embed-v4.0` (multimodal) — text embeddings only in M3a per direction change.
 - OpenAI: `text-embedding-3-small`.
 
-Batching: each `embed` call makes one HTTP request. Callers must chunk before the per-provider per-request input limit (OpenAI: 2048, Cohere: 96 for v3). Auto-chunking is a future M3b candidate.
+Batching: M3a originally shipped with one HTTP request per `embed` call and required callers to hand-shard before the per-provider per-request input limit (OpenAI: 2048, Cohere v3: 96). M6c folded auto-chunking inside the shipped concrete embedders themselves; the agnostic `Embedder` boundary is unchanged but the shipped `OpenAiEmbedder` / `CohereEmbedder` now transparently issue multiple HTTP requests when needed and concatenate per-chunk results in input order. See the M6c section below.
 
 Tests:
 
 - Provider-local `mockito` tests per embedder: success / auth / rate-limit-with-Retry-After / invalid-request / server-error / malformed-JSON / empty-embeddings-`MalformedResponse` / model-serialization. Plus one `#[ignore]` live test per provider gated on the respective env var.
 - Provider-agnostic synthetic-2D selection tests: hand-built clusters at corners of a square; both `Centroid` and `FarthestPointSampling` strategies pick one representative per cluster when `max_n` matches the cluster count. Plus `max_n` and `similarity_tripwire` each tested in isolation.
 
-**M3b (deferred, not in this slice).** Auto-chunking inside `Embedder::embed` with backpressure. Multimodal embedding support (Cohere `embed-v4.0` / OpenAI image-embedding endpoints if they emerge). Additional providers (Voyage, Mixedbread, etc.) as motivated. Embedding-side retry helper analogous to the completions path if real-world rate limits make it necessary.
+**M3b (deferred, not in this slice).** Multimodal embedding support (Cohere `embed-v4.0` / OpenAI image-embedding endpoints if they emerge). Additional providers (Voyage, Mixedbread, etc.) as motivated. Embedding-side retry helper analogous to the completions path if real-world rate limits make it necessary. (Auto-chunking inside `Embedder::embed` was originally an M3b candidate; it landed under M6c instead — see the M6c section.)
 
 ### M4 — Judge Phase
 
@@ -209,7 +209,14 @@ Removed from `src/lib.rs` as part of this slice: the M0-era `ORDERED_JUDGEMENT_S
 - Failure preservation unchanged: planner failures still surface inline as `PromptOutcome::Failed` and never terminate the stream.
 - **Verified:** `cargo test --lib` is 111 passed / 0 failed / 5 ignored (+4 over M6a's 107). Four new tests: builder rejects `parallelism = 0`; in-order delivery when prompt 0's judge sleeps 200 ms while prompts 1 and 2 finish immediately (mockito body-matching + real-time `tokio::time::sleep`); bounded concurrency via a custom `JudgeProvider` that pins each invocation at a shared `tokio::sync::Barrier(parallelism)` and asserts `max_seen == parallelism` (with an outer `tokio::time::timeout` to surface deadlocks as clean failures); partial-failure-under-concurrency interleaving two failing planners and three successes at `parallelism = 3`.
 
-**M6c (deferred, not in this slice).** Auto-chunking inside per-provider embedder impls (OpenAI: 2048, Cohere v3: 96) so callers do not hand-shard large prompt batches. Closely related to M3b.
+**M6c — Auto-chunking inside the shipped embedders: landed.** See [2026-05-16 — M6c Embedder Auto-Chunking](../journal/2026-05-16-m6c-embedder-auto-chunking.md).
+
+- Public agnostic embedding boundary unchanged. `Embedder::embed(&[String])` keeps its signature; its doc updated to note that shipped impls auto-chunk while custom impls remain free to issue a single request.
+- Each shipped embedder gains a crate-private `const MAX_INPUTS_PER_REQUEST` (`2048` for OpenAI's `/v1/embeddings`, `96` for Cohere v3's `/v2/embed`) and a tiny chunking shell `*_embed_raw` that calls an unchanged `*_embed_chunk` helper per chunk. The single-chunk path (which includes the empty-input case) calls the chunk helper directly with the original slice, so the common case allocates nothing extra. The over-limit path pre-allocates `Vec::with_capacity(inputs.len())` once and extends from each chunk's owned `EmbeddingBatch`.
+- Per-chunk `EmbeddingUsage.input_tokens` are aggregated via `saturating_add` into one returned [`EmbeddingUsage`].
+- Sequential per-chunk execution. A failing chunk short-circuits with its typed `*EmbeddingFailure` mapped through the existing `*_failure_to_agnostic` shim — no partial-success surface, no in-flight chunks to discard.
+- **Verified:** `cargo test --lib` is 115 passed / 0 failed / 5 ignored (+4 over M6b's 111). Four new tests: per-provider over-limit success (asserts exact `vectors[i] = [i as f32, 0.0]` ordering across the chunk boundary and aggregated `EmbeddingUsage`) and per-provider later-chunk failure (asserts the typed `AgnosticEmbeddingError` from chunk 1 surfaces verbatim, no partial batch returned). Chunk routing under `mockito` uses unique-marker substrings on each chunk's first input plus `Matcher::Regex`. Pre-existing 33 clippy warnings unchanged (M7 stubs + one `collapsible_if` in `diversification`, both pre-flagged as out of scope).
+- **M6c (deferred follow-ups).** Multimodal Cohere `embed-v4.0` would need its own per-request limit and a separate chunking path. Provider-side hardening to map mixed-dimension responses as `MalformedResponse` earlier (so the dataset layer never has to see them, per the M6a post-review note) still pending.
 
 ### M7 — Remaining Four Providers
 

@@ -10,6 +10,11 @@ use crate::embeddings::{
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 
+/// Maximum number of inputs accepted by OpenAI's `/v1/embeddings` endpoint in a
+/// single request. Used to auto-chunk over-limit batches inside
+/// [`OpenAiEmbedder::embed`] so callers never need to hand-shard.
+const MAX_INPUTS_PER_REQUEST: usize = 2048;
+
 #[derive(Debug, Clone)]
 pub struct OpenAiEmbedder {
     http: reqwest::Client,
@@ -170,7 +175,35 @@ impl Embedder for OpenAiEmbedder {
     }
 }
 
+/// Top-level entry point used by [`Embedder::embed`]. Auto-chunks
+/// `inputs.chunks(MAX_INPUTS_PER_REQUEST)` and concatenates per-chunk results
+/// in input order. The single-chunk path (including the empty-input case)
+/// calls [`openai_embed_chunk`] directly with the original slice, so no extra
+/// allocation happens in the common case. A failing chunk short-circuits with
+/// its typed [`OpenAiEmbeddingFailure`]; vectors from earlier chunks are not
+/// returned partially.
 async fn openai_embed_raw(
+    embedder: &OpenAiEmbedder,
+    inputs: &[String],
+) -> Result<EmbeddingBatch, OpenAiEmbeddingFailure> {
+    if inputs.len() <= MAX_INPUTS_PER_REQUEST {
+        return openai_embed_chunk(embedder, inputs).await;
+    }
+
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
+    let mut input_tokens: u64 = 0;
+    for chunk in inputs.chunks(MAX_INPUTS_PER_REQUEST) {
+        let batch = openai_embed_chunk(embedder, chunk).await?;
+        vectors.extend(batch.vectors);
+        input_tokens = input_tokens.saturating_add(batch.usage.input_tokens);
+    }
+    Ok(EmbeddingBatch {
+        vectors,
+        usage: EmbeddingUsage { input_tokens },
+    })
+}
+
+async fn openai_embed_chunk(
     embedder: &OpenAiEmbedder,
     inputs: &[String],
 ) -> Result<EmbeddingBatch, OpenAiEmbeddingFailure> {
@@ -589,6 +622,176 @@ mod tests {
                 assert!(reason.contains("missing index 1"), "got: {reason}");
             }
             other => panic!("expected MalformedResponse, got {other:?}"),
+        }
+    }
+
+    /// Build a synthetic OpenAI embeddings response covering `count` entries.
+    /// Each entry's `embedding` is `[(starting_global + chunk_local_index) as
+    /// f32, 0.0]`, so callers can recover the exact input-position from the
+    /// returned vector's first element and assert order is preserved across
+    /// chunks.
+    fn build_openai_chunk_response_body(
+        starting_global: usize,
+        count: usize,
+        tokens: u64,
+    ) -> String {
+        let data: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "object": "embedding",
+                    "index": i,
+                    "embedding": [(starting_global + i) as f32, 0.0_f32],
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "object": "list",
+            "data": data,
+            "model": "text-embedding-3-small",
+            "usage": { "prompt_tokens": tokens, "total_tokens": tokens },
+        })
+        .to_string()
+    }
+
+    /// Build `total` input strings where the first input of each expected
+    /// chunk carries a unique `marker` substring so mockito body matchers can
+    /// route each chunk's request to its own mock without false positives.
+    fn marker_inputs_for_two_chunks(
+        total: usize,
+        chunk_size: usize,
+        marker_a: &str,
+        marker_b: &str,
+    ) -> Vec<String> {
+        let mut inputs = Vec::with_capacity(total);
+        for i in 0..total {
+            let s = if i == 0 {
+                marker_a.to_string()
+            } else if i == chunk_size {
+                marker_b.to_string()
+            } else {
+                format!("input-{i}")
+            };
+            inputs.push(s);
+        }
+        inputs
+    }
+
+    /// Over-limit batch (`MAX_INPUTS_PER_REQUEST + 2` inputs) must auto-chunk
+    /// into two `/v1/embeddings` requests, concatenate vectors in input order,
+    /// and sum the per-chunk `usage.input_tokens` into one aggregated
+    /// [`EmbeddingUsage`].
+    #[tokio::test]
+    async fn auto_chunks_over_limit_inputs_and_preserves_order_with_aggregated_usage() {
+        let total = MAX_INPUTS_PER_REQUEST + 2;
+        let inputs = marker_inputs_for_two_chunks(
+            total,
+            MAX_INPUTS_PER_REQUEST,
+            "openai-auto-chunk-0-marker",
+            "openai-auto-chunk-1-marker",
+        );
+
+        let chunk_0_body =
+            build_openai_chunk_response_body(0, MAX_INPUTS_PER_REQUEST, 100);
+        let chunk_1_body =
+            build_openai_chunk_response_body(MAX_INPUTS_PER_REQUEST, 2, 50);
+
+        let mut server = mockito::Server::new_async().await;
+        let m0 = server
+            .mock("POST", "/v1/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "openai-auto-chunk-0-marker".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chunk_0_body)
+            .expect(1)
+            .create_async()
+            .await;
+        let m1 = server
+            .mock("POST", "/v1/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "openai-auto-chunk-1-marker".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chunk_1_body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let embedder =
+            OpenAiEmbedder::new_with_base_url("test-key".to_string(), server.url());
+        let batch = embedder.embed(&inputs).await.expect("multi-chunk embed");
+
+        assert_eq!(batch.vectors.len(), total, "one vector per input");
+        for (i, v) in batch.vectors.iter().enumerate() {
+            assert_eq!(
+                v,
+                &vec![i as f32, 0.0_f32],
+                "vector at global index {i} mismatched — chunk concatenation broke ordering"
+            );
+        }
+        assert_eq!(
+            batch.usage.input_tokens, 150,
+            "aggregated usage must sum across chunks (100 + 50)"
+        );
+
+        m0.assert_async().await;
+        m1.assert_async().await;
+    }
+
+    /// A later-chunk failure must surface as the correct typed
+    /// [`AgnosticEmbeddingError`] from that chunk. Vectors from prior
+    /// successful chunks must not leak out as a partial-success
+    /// [`EmbeddingBatch`].
+    #[tokio::test]
+    async fn auto_chunking_propagates_later_chunk_failure_without_silent_truncation() {
+        let total = MAX_INPUTS_PER_REQUEST + 2;
+        let inputs = marker_inputs_for_two_chunks(
+            total,
+            MAX_INPUTS_PER_REQUEST,
+            "openai-fail-chunk-0-marker",
+            "openai-fail-chunk-1-marker",
+        );
+
+        let chunk_0_body =
+            build_openai_chunk_response_body(0, MAX_INPUTS_PER_REQUEST, 100);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m0 = server
+            .mock("POST", "/v1/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "openai-fail-chunk-0-marker".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chunk_0_body)
+            .expect(1)
+            .create_async()
+            .await;
+        let _m1 = server
+            .mock("POST", "/v1/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "openai-fail-chunk-1-marker".to_string(),
+            ))
+            .with_status(401)
+            .with_body(r#"{"error":{"message":"Invalid API key on chunk 1"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let embedder =
+            OpenAiEmbedder::new_with_base_url("test-key".to_string(), server.url());
+        let err = embedder
+            .embed(&inputs)
+            .await
+            .expect_err("later-chunk failure must surface, not be silently truncated");
+        match err {
+            AgnosticEmbeddingError::Auth { provider, message } => {
+                assert_eq!(provider, crate::EmbeddingProvider::OpenAi);
+                assert_eq!(message.as_deref(), Some("Invalid API key on chunk 1"));
+            }
+            other => panic!("expected Auth from second chunk, got {other:?}"),
         }
     }
 

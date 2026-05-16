@@ -45,10 +45,12 @@
 //! ## What M6b deliberately is not
 //!
 //! No `tokio::spawn` — concurrency is single-task cooperative, so the per-run
-//! state does not need to become `Send`. Embedding is still a single batch
-//! call (auto-chunking is M3b/M6c territory). Judge concurrency within a
-//! single prompt stays inherited from M5a (sequential within a phase).
-//! Streaming events (`PhaseEvent`, callback hooks) are M5c work.
+//! state does not need to become `Send`. Embedding is still a single
+//! [`Embedder::embed`] call from the dataset layer's perspective; auto-chunking
+//! over the provider per-request limits is now transparent inside the shipped
+//! embedders themselves (M6c). Judge concurrency within a single prompt stays
+//! inherited from M5a (sequential within a phase). Streaming events
+//! (`PhaseEvent`, callback hooks) are M5c work.
 
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
