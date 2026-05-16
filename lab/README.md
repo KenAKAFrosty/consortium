@@ -43,4 +43,5 @@ Use it to capture meaningful directions, experiments, decisions, and course corr
 - [M6a Dataset Builder And JSONL Pipeline](./journal/2026-05-15-m6a-dataset-builder-and-jsonl-pipeline.md)
 - [M6b Bounded Per-Prompt Parallelism](./journal/2026-05-16-m6b-bounded-per-prompt-parallelism.md)
 - [M6c Embedder Auto-Chunking](./journal/2026-05-16-m6c-embedder-auto-chunking.md)
+- [M5b Parallel Judge Fan-Out](./journal/2026-05-16-m5b-parallel-judge-fanout.md)
 - [Decision 0001: Owned Types At Async Boundaries](./decisions/0001-owned-types-at-async-boundaries.md)

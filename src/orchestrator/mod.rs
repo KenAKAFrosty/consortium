@@ -1,6 +1,6 @@
 //! Two-phase consortium orchestrator for a single prompt.
 //!
-//! This is the M5a slice of the consortium pipeline. The orchestrator:
+//! The orchestrator:
 //!
 //! 1. Fans out `N` completion samples per configured model slot (Phase 1
 //!    sampling) using the existing M1 [`crate::multi_infer`] machinery — every
@@ -29,12 +29,41 @@
 //! Streaming / hooks (`mpsc` channel, callback trait) are intentionally not in
 //! this slice — the in-memory result shape comes first; streaming can be added
 //! later as an alternative surface over the same orchestration.
+//!
+//! ## Concurrency (M5b)
+//!
+//! Phase 1 sampling has always been a single concurrent [`crate::multi_infer`]
+//! fan-out across every `(slot, sample)` pair. M5b extends concurrency to the
+//! parts that were sequential under M5a:
+//!
+//! - **Per-slot judges in Phase 1.** The judges configured for a single slot
+//!   are invoked concurrently against that slot's blind candidate set via a
+//!   local [`futures::stream::FuturesUnordered`]. Results are reordered into
+//!   original judge order before being written to [`ModelPhaseOutcome::judge_outcomes`].
+//! - **Slot-level Phase 1.** The per-slot [`phase_one_for_slot`] futures
+//!   themselves run concurrently inside another [`futures::stream::FuturesUnordered`],
+//!   reordered by `slot_index` before becoming [`ConsortiumOutcome::phase_one`].
+//! - **Phase 2 judges.** The cross-model judges run concurrently with the same
+//!   reorder pattern.
+//!
+//! Concurrency stays single-task / cooperative — no [`tokio::spawn`], no `Send`
+//! refactor. The orchestrator's future remains non-`Send` (it captures
+//! `&dyn JudgeProvider` across `.await` points, and `dyn JudgeProvider` does
+//! not pick up its supertrait `Sync` bound on the trait object itself), which
+//! matches the existing dataset-stream contract from M6b.
+//!
+//! Public surface is unchanged: [`consortium_completion`] returns the same
+//! [`ConsortiumOutcome`] shape and preserves every order, provenance, and
+//! failure invariant from M5a even when internal futures complete out of
+//! order.
 
-use futures::future::BoxFuture;
+use futures::FutureExt;
+use futures::future::{BoxFuture, LocalBoxFuture};
+use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::judge::{
-    AggregatedRanking, BlindId, Candidate, JudgeRequest, JudgementError, OrderedJudgement,
-    aggregate_rankings, assign_blind_ids, judge_rank,
+    AggregatedRanking, BlindCandidate, BlindId, Candidate, JudgeRequest, JudgementError,
+    OrderedJudgement, aggregate_rankings, assign_blind_ids, judge_rank,
 };
 use crate::{
     AgnosticCompletionError, AgnosticCompletionOutput, AiCompletionInputs,
@@ -244,13 +273,34 @@ pub async fn consortium_completion<'a>(
         bag.sort_by_key(|s| s.sample_index);
     }
 
-    let mut phase_one: Vec<ModelPhaseOutcome> = Vec::with_capacity(slots.len());
+    // Phase 1 across slots runs concurrently inside a local FuturesUnordered;
+    // outputs are reordered by slot_index so `phase_one` is deterministic
+    // regardless of completion order. No `tokio::spawn` — keeps the
+    // orchestrator's future single-task / non-`Send`, matching the dataset
+    // stream contract.
+    let mut slot_fanout: FuturesUnordered<LocalBoxFuture<'_, (usize, ModelPhaseOutcome)>> =
+        FuturesUnordered::new();
     for (slot_index, slot) in slots.iter().enumerate() {
         let slot_samples = std::mem::take(&mut by_slot[slot_index]);
         let provider = slot.input.provider();
-        let outcome = phase_one_for_slot(slot, provider, slot_samples, judges).await;
-        phase_one.push(outcome);
+        slot_fanout.push(
+            async move {
+                let outcome = phase_one_for_slot(slot, provider, slot_samples, judges).await;
+                (slot_index, outcome)
+            }
+            .boxed_local(),
+        );
     }
+
+    let mut phase_one_buf: Vec<Option<ModelPhaseOutcome>> =
+        (0..slots.len()).map(|_| None).collect();
+    while let Some((slot_index, outcome)) = slot_fanout.next().await {
+        phase_one_buf[slot_index] = Some(outcome);
+    }
+    let phase_one: Vec<ModelPhaseOutcome> = phase_one_buf
+        .into_iter()
+        .map(|o| o.expect("every slot future writes its slot_index slot exactly once"))
+        .collect();
 
     let phase_two = phase_two_outcome(&phase_one, judges).await;
 
@@ -323,19 +373,7 @@ async fn phase_one_for_slot<'a>(
         };
     }
 
-    let mut judge_outcomes: Vec<JudgeOutcome> = Vec::with_capacity(judges.len());
-    let mut successful: Vec<OrderedJudgement> = Vec::new();
-    for judge in judges {
-        let label = judge.label().to_string();
-        let result = judge_rank(&blind, |req| judge.invoke(req)).await;
-        if let Ok(judgement) = &result {
-            successful.push(judgement.clone());
-        }
-        judge_outcomes.push(JudgeOutcome {
-            judge_label: label,
-            result,
-        });
-    }
+    let (judge_outcomes, successful) = invoke_judges_in_parallel(&blind, judges).await;
 
     let aggregated = if successful.is_empty() {
         None
@@ -365,6 +403,55 @@ async fn phase_one_for_slot<'a>(
         aggregated,
         winner,
     }
+}
+
+/// Invoke every judge against `blind` concurrently inside a local
+/// [`FuturesUnordered`], then reorder results by `judge_index` so the returned
+/// [`JudgeOutcome`] vec mirrors the caller's original `judges` slice. Also
+/// returns the cloned-out successful [`OrderedJudgement`]s in the same input
+/// order, ready for [`aggregate_rankings`].
+///
+/// Concurrency is bounded by `judges.len()` — there is no explicit cap because
+/// judge counts are configured up-front and stay small (single digits in
+/// practice). No `tokio::spawn`; the futures run cooperatively in the calling
+/// task. Result determinism comes from the reorder buffer, not from completion
+/// order.
+async fn invoke_judges_in_parallel<'a>(
+    blind: &[BlindCandidate],
+    judges: &'a [&'a dyn JudgeProvider],
+) -> (Vec<JudgeOutcome>, Vec<OrderedJudgement>) {
+    let mut in_flight: FuturesUnordered<LocalBoxFuture<'_, (usize, JudgeOutcome)>> =
+        FuturesUnordered::new();
+    for (judge_index, judge) in judges.iter().enumerate() {
+        let label = judge.label().to_string();
+        in_flight.push(
+            async move {
+                let result = judge_rank(blind, |req| judge.invoke(req)).await;
+                (
+                    judge_index,
+                    JudgeOutcome {
+                        judge_label: label,
+                        result,
+                    },
+                )
+            }
+            .boxed_local(),
+        );
+    }
+
+    let mut buf: Vec<Option<JudgeOutcome>> = (0..judges.len()).map(|_| None).collect();
+    while let Some((idx, outcome)) = in_flight.next().await {
+        buf[idx] = Some(outcome);
+    }
+    let judge_outcomes: Vec<JudgeOutcome> = buf
+        .into_iter()
+        .map(|o| o.expect("every judge future writes its judge_index slot exactly once"))
+        .collect();
+    let successful: Vec<OrderedJudgement> = judge_outcomes
+        .iter()
+        .filter_map(|jo| jo.result.as_ref().ok().cloned())
+        .collect();
+    (judge_outcomes, successful)
 }
 
 async fn phase_two_outcome<'a>(
@@ -422,19 +509,7 @@ async fn phase_two_outcome<'a>(
         });
     }
 
-    let mut judge_outcomes: Vec<JudgeOutcome> = Vec::with_capacity(judges.len());
-    let mut successful: Vec<OrderedJudgement> = Vec::new();
-    for judge in judges {
-        let label = judge.label().to_string();
-        let result = judge_rank(&blind, |req| judge.invoke(req)).await;
-        if let Ok(judgement) = &result {
-            successful.push(judgement.clone());
-        }
-        judge_outcomes.push(JudgeOutcome {
-            judge_label: label,
-            result,
-        });
-    }
+    let (judge_outcomes, successful) = invoke_judges_in_parallel(&blind, judges).await;
 
     let aggregated = if successful.is_empty() {
         None
@@ -847,5 +922,532 @@ mod tests {
         assert_eq!(p2_winner.model_index, 1);
         assert_eq!(p2_winner.model_label, "openai-b");
         assert_eq!(p2_winner.content, "bravo");
+    }
+
+    // ---------- M5b: parallel judge fan-out ----------
+
+    /// Test-only [`JudgeProvider`] that pins each invocation at a shared
+    /// [`tokio::sync::Barrier`]. The barrier only releases once exactly
+    /// `Barrier::new(n)` calls are concurrently suspended — direct evidence
+    /// that the orchestrator keeps that many judges in flight at once. The
+    /// caller chooses the barrier size to match its expected concurrency.
+    /// `record` is the judge's label, pushed in the order each invocation
+    /// crosses the barrier so a test can correlate completion order with
+    /// emit order.
+    struct BarrierJudge {
+        label: String,
+        barrier: std::sync::Arc<tokio::sync::Barrier>,
+        active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        max_seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        completion_order: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl JudgeProvider for BarrierJudge {
+        fn label(&self) -> &str {
+            &self.label
+        }
+
+        fn invoke<'a>(
+            &'a self,
+            request: JudgeRequest,
+        ) -> BoxFuture<'a, Result<String, AgnosticCompletionError>> {
+            use std::sync::atomic::Ordering;
+            let barrier = self.barrier.clone();
+            let active = self.active.clone();
+            let max_seen = self.max_seen.clone();
+            let completion_order = self.completion_order.clone();
+            let label = self.label.clone();
+            Box::pin(async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                // Suspends until the barrier has released exactly `barrier`
+                // judge calls — the central concurrency-proof pivot.
+                barrier.wait().await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                completion_order.lock().unwrap().push(label.clone());
+
+                let n = request.user_message.matches("[c").count();
+                let ids: Vec<String> = (1..=n).map(|i| format!("c{i}")).collect();
+                Ok(format!(
+                    "<reasoning>r</reasoning><ranking>{}</ranking>",
+                    ids.join(",")
+                ))
+            })
+        }
+    }
+
+    /// Judges within a single Phase 1 slot run concurrently — proven by a
+    /// `tokio::sync::Barrier` sized to the judge count, which would deadlock
+    /// if judges were invoked sequentially. After the barrier releases, the
+    /// returned `judge_outcomes` must still be in original input order
+    /// `[j1, j2, j3]` regardless of which judge's barrier wait resolved
+    /// first.
+    #[tokio::test]
+    async fn phase_one_judges_run_in_parallel_within_a_slot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+        let client = OpenAiClient::new_with_base_url("k".to_string(), server.url());
+        let cmd = ok_command("p");
+
+        let slots = vec![ConsortiumSlot {
+            input: AiCompletionInputs::OpenAi(&client, &cmd),
+            model_label: "slot-a".to_string(),
+            samples: 2,
+        }];
+
+        let parallelism = 3;
+        let barrier = Arc::new(tokio::sync::Barrier::new(parallelism));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let completion_order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let j1 = BarrierJudge {
+            label: "j1".to_string(),
+            barrier: barrier.clone(),
+            active: active.clone(),
+            max_seen: max_seen.clone(),
+            completion_order: completion_order.clone(),
+        };
+        let j2 = BarrierJudge {
+            label: "j2".to_string(),
+            barrier: barrier.clone(),
+            active: active.clone(),
+            max_seen: max_seen.clone(),
+            completion_order: completion_order.clone(),
+        };
+        let j3 = BarrierJudge {
+            label: "j3".to_string(),
+            barrier,
+            active: active.clone(),
+            max_seen: max_seen.clone(),
+            completion_order: completion_order.clone(),
+        };
+        let judges: Vec<&dyn JudgeProvider> = vec![&j1, &j2, &j3];
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            consortium_completion(&slots, &judges),
+        )
+        .await
+        .expect("orchestrator hung — judges likely ran sequentially and the barrier deadlocked");
+
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            parallelism,
+            "all judges should have been concurrently in flight at once"
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+
+        // judge_outcomes preserves the caller's input order regardless of
+        // which judge completed the barrier-wait first.
+        let slot_a = &outcome.phase_one[0];
+        let labels: Vec<&str> = slot_a
+            .judge_outcomes
+            .iter()
+            .map(|jo| jo.judge_label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["j1", "j2", "j3"],
+            "judge_outcomes must be in original input order even when futures complete out of order"
+        );
+        for jo in &slot_a.judge_outcomes {
+            assert!(jo.result.is_ok(), "all parallel judges should succeed");
+        }
+    }
+
+    /// Phase 2 cross-model judges run concurrently with the same
+    /// barrier-pinning pattern, and the cross-model `judge_outcomes` are in
+    /// original judge order.
+    #[tokio::test]
+    async fn phase_two_judges_run_in_parallel_with_preserved_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        // Two slots, single sample each, single completion content so each
+        // slot trivially produces a Phase 1 winner without judges (singleton
+        // short-circuit). Phase 2 then judges both winners across models.
+        let mut server_a = mockito::Server::new_async().await;
+        let _mock_a = server_a
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "alpha"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let mut server_b = mockito::Server::new_async().await;
+        let _mock_b = server_b
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "bravo"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let client_a = OpenAiClient::new_with_base_url("k".to_string(), server_a.url());
+        let client_b = OpenAiClient::new_with_base_url("k".to_string(), server_b.url());
+        let cmd_a = ok_command("a");
+        let cmd_b = ok_command("b");
+
+        let slots = vec![
+            ConsortiumSlot {
+                input: AiCompletionInputs::OpenAi(&client_a, &cmd_a),
+                model_label: "openai-a".to_string(),
+                samples: 1,
+            },
+            ConsortiumSlot {
+                input: AiCompletionInputs::OpenAi(&client_b, &cmd_b),
+                model_label: "openai-b".to_string(),
+                samples: 1,
+            },
+        ];
+
+        let parallelism = 3;
+        let barrier = Arc::new(tokio::sync::Barrier::new(parallelism));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let completion_order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let j1 = BarrierJudge {
+            label: "j1".to_string(),
+            barrier: barrier.clone(),
+            active: active.clone(),
+            max_seen: max_seen.clone(),
+            completion_order: completion_order.clone(),
+        };
+        let j2 = BarrierJudge {
+            label: "j2".to_string(),
+            barrier: barrier.clone(),
+            active: active.clone(),
+            max_seen: max_seen.clone(),
+            completion_order: completion_order.clone(),
+        };
+        let j3 = BarrierJudge {
+            label: "j3".to_string(),
+            barrier,
+            active: active.clone(),
+            max_seen: max_seen.clone(),
+            completion_order: completion_order.clone(),
+        };
+        let judges: Vec<&dyn JudgeProvider> = vec![&j1, &j2, &j3];
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            consortium_completion(&slots, &judges),
+        )
+        .await
+        .expect("orchestrator hung — Phase 2 judges likely ran sequentially");
+
+        // Phase 1 slots use the singleton short-circuit (1 sample each, no
+        // judges), so the only judge invocations happened in Phase 2.
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            parallelism,
+            "Phase 2 should have run all judges concurrently"
+        );
+        let phase_two = outcome.phase_two.expect("phase 2 with two surviving slots");
+        assert_eq!(phase_two.judge_outcomes.len(), 3);
+        let labels: Vec<&str> = phase_two
+            .judge_outcomes
+            .iter()
+            .map(|jo| jo.judge_label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["j1", "j2", "j3"],
+            "Phase 2 judge_outcomes must be in original input order"
+        );
+    }
+
+    /// Slots within Phase 1 are judged concurrently — the slowest slot does
+    /// not block faster slots from running their own judges. Even though
+    /// Phase 1 sampling has always been concurrent via `multi_infer`, M5b
+    /// makes the judging step concurrent across slots too. Determinism is
+    /// proven by ordering `phase_one` strictly by slot_index.
+    #[tokio::test(start_paused = true)]
+    async fn phase_one_slots_run_concurrently_with_preserved_slot_order() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        // Three slots, single sample each. Slot 0's judge sleeps; slots 1
+        // and 2 are fast. With sequential per-slot judging, slot 1 cannot
+        // start before slot 0 finishes — so a "slot 1 finished before slot
+        // 0 started judging" flag would never trip. Under M5b, the slot
+        // futures run concurrently, so slot 1's judge starts and finishes
+        // while slot 0 is still sleeping. We use `start_paused` plus
+        // `tokio::time::sleep` so the slow slot's delay is virtual.
+        let mut server_a = mockito::Server::new_async().await;
+        let _ma = server_a
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "S0-content"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+        let mut server_b = mockito::Server::new_async().await;
+        let _mb = server_b
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "S1-content"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+        let mut server_c = mockito::Server::new_async().await;
+        let _mc = server_c
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "S2-content"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+
+        let client_a = OpenAiClient::new_with_base_url("k".to_string(), server_a.url());
+        let client_b = OpenAiClient::new_with_base_url("k".to_string(), server_b.url());
+        let client_c = OpenAiClient::new_with_base_url("k".to_string(), server_c.url());
+        let cmd_a = ok_command("a");
+        let cmd_b = ok_command("b");
+        let cmd_c = ok_command("c");
+
+        let slots = vec![
+            ConsortiumSlot {
+                input: AiCompletionInputs::OpenAi(&client_a, &cmd_a),
+                model_label: "slot-0".to_string(),
+                samples: 2,
+            },
+            ConsortiumSlot {
+                input: AiCompletionInputs::OpenAi(&client_b, &cmd_b),
+                model_label: "slot-1".to_string(),
+                samples: 2,
+            },
+            ConsortiumSlot {
+                input: AiCompletionInputs::OpenAi(&client_c, &cmd_c),
+                model_label: "slot-2".to_string(),
+                samples: 2,
+            },
+        ];
+
+        // `slot_0_finished` flips true at the end of slot 0's judging.
+        // `slot_1_finished_before_slot_0` records whether slot 1's judging
+        // completed while slot 0 was still pending — which can only happen
+        // if slot-level Phase 1 work runs concurrently.
+        let slot_0_finished = Arc::new(AtomicBool::new(false));
+        let slot_1_finished_before_slot_0 = Arc::new(AtomicBool::new(false));
+
+        struct OrderingJudge {
+            label: String,
+            slow_marker: String,
+            slot1_marker: String,
+            slow_delay: Duration,
+            slot_0_finished: Arc<AtomicBool>,
+            slot_1_finished_before_slot_0: Arc<AtomicBool>,
+        }
+        impl JudgeProvider for OrderingJudge {
+            fn label(&self) -> &str {
+                &self.label
+            }
+            fn invoke<'a>(
+                &'a self,
+                request: JudgeRequest,
+            ) -> BoxFuture<'a, Result<String, AgnosticCompletionError>> {
+                let slow_marker = self.slow_marker.clone();
+                let slot1_marker = self.slot1_marker.clone();
+                let slow_delay = self.slow_delay;
+                let slot_0_finished = self.slot_0_finished.clone();
+                let slot_1_finished_before_slot_0 =
+                    self.slot_1_finished_before_slot_0.clone();
+                Box::pin(async move {
+                    let user = request.user_message;
+                    let is_slow = user.contains(&slow_marker);
+                    if is_slow {
+                        tokio::time::sleep(slow_delay).await;
+                    }
+                    if user.contains(&slot1_marker)
+                        && !slot_0_finished.load(Ordering::SeqCst)
+                    {
+                        slot_1_finished_before_slot_0.store(true, Ordering::SeqCst);
+                    }
+                    if is_slow {
+                        slot_0_finished.store(true, Ordering::SeqCst);
+                    }
+                    let n = user.matches("[c").count();
+                    let ids: Vec<String> = (1..=n).map(|i| format!("c{i}")).collect();
+                    Ok(format!(
+                        "<reasoning>r</reasoning><ranking>{}</ranking>",
+                        ids.join(",")
+                    ))
+                })
+            }
+        }
+
+        let j = OrderingJudge {
+            label: "j".to_string(),
+            slow_marker: "S0-content".to_string(),
+            slot1_marker: "S1-content".to_string(),
+            slow_delay: Duration::from_secs(60),
+            slot_0_finished: slot_0_finished.clone(),
+            slot_1_finished_before_slot_0: slot_1_finished_before_slot_0.clone(),
+        };
+        let judges: Vec<&dyn JudgeProvider> = vec![&j];
+
+        let outcome = consortium_completion(&slots, &judges).await;
+
+        assert!(
+            slot_1_finished_before_slot_0.load(Ordering::SeqCst),
+            "slot 1 should finish judging before slot 0 — proves slot futures run concurrently"
+        );
+        assert!(slot_0_finished.load(Ordering::SeqCst));
+
+        // phase_one is in slot_index order regardless of completion order.
+        assert_eq!(outcome.phase_one.len(), 3);
+        let labels: Vec<&str> = outcome
+            .phase_one
+            .iter()
+            .map(|po| po.model_label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["slot-0", "slot-1", "slot-2"]);
+        for po in &outcome.phase_one {
+            assert!(po.winner.is_some());
+        }
+    }
+
+    /// Failed judges must be preserved at their original judge_index even
+    /// when judges run concurrently. Mixing Err and Ok results across the
+    /// reorder buffer is the load-bearing case — a naive "push as they
+    /// arrive" implementation would interleave them by completion order
+    /// instead.
+    #[tokio::test]
+    async fn parallel_phase_one_preserves_failed_judges_at_their_input_index() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "alpha"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+        let client = OpenAiClient::new_with_base_url("k".to_string(), server.url());
+        let cmd = ok_command("p");
+
+        let slots = vec![ConsortiumSlot {
+            input: AiCompletionInputs::OpenAi(&client, &cmd),
+            model_label: "slot-a".to_string(),
+            samples: 2,
+        }];
+
+        // j1 succeeds, j2 fails, j3 succeeds, j4 fails. Under parallel
+        // execution, futures can resolve in any order. The reorder buffer
+        // must restore [Ok, Err, Ok, Err] by judge_index.
+        let always_c1_then_rest = |req: JudgeRequest| -> Result<String, AgnosticCompletionError> {
+            let n = req.user_message.matches("[c").count();
+            let ids: Vec<String> = (1..=n).map(|i| format!("c{i}")).collect();
+            Ok(format!(
+                "<reasoning>c1 wins</reasoning><ranking>{}</ranking>",
+                ids.join(",")
+            ))
+        };
+        let always_err = |_: JudgeRequest| -> Result<String, AgnosticCompletionError> {
+            Err(AgnosticCompletionError::Auth {
+                provider: ProviderKind::OpenAi,
+                message: Some("bad judge key".to_string()),
+            })
+        };
+
+        let j1 = FnJudge {
+            label: "j1".to_string(),
+            f: always_c1_then_rest,
+        };
+        let j2 = FnJudge {
+            label: "j2".to_string(),
+            f: always_err,
+        };
+        let j3 = FnJudge {
+            label: "j3".to_string(),
+            f: always_c1_then_rest,
+        };
+        let j4 = FnJudge {
+            label: "j4".to_string(),
+            f: always_err,
+        };
+        let judges: Vec<&dyn JudgeProvider> = vec![&j1, &j2, &j3, &j4];
+
+        let outcome = consortium_completion(&slots, &judges).await;
+        let slot_a = &outcome.phase_one[0];
+
+        assert_eq!(slot_a.judge_outcomes.len(), 4);
+        let expected: [(&str, bool); 4] =
+            [("j1", true), ("j2", false), ("j3", true), ("j4", false)];
+        for (i, (label, is_ok)) in expected.iter().enumerate() {
+            let jo = &slot_a.judge_outcomes[i];
+            assert_eq!(jo.judge_label, *label, "judge_outcomes[{i}] label");
+            assert_eq!(
+                jo.result.is_ok(),
+                *is_ok,
+                "judge_outcomes[{i}] success state mismatched — reorder buffer should keep \
+                 failed judges aligned with their original input position"
+            );
+            if !*is_ok {
+                match &jo.result {
+                    Err(JudgementError::Provider(AgnosticCompletionError::Auth {
+                        message,
+                        ..
+                    })) => {
+                        assert_eq!(message.as_deref(), Some("bad judge key"));
+                    }
+                    other => panic!("expected JudgementError::Provider(Auth), got {other:?}"),
+                }
+            }
+        }
+
+        // Aggregation still uses the two successful judges and picks a
+        // winner, proving parallel fan-out did not break Borda.
+        assert!(slot_a.aggregated.is_some());
+        assert!(slot_a.winner.is_some());
     }
 }
