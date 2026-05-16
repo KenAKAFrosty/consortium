@@ -1,4 +1,6 @@
 mod ai_client_apis;
+pub mod diversification;
+pub mod embeddings;
 
 use std::time::{Duration, Instant};
 
@@ -21,6 +23,17 @@ pub use crate::ai_client_apis::openai::{
     OpenAiClient, OpenAiClientError, OpenAiCompletionCommand, OpenAiMessage, OpenAiModel,
     OpenAiRole,
 };
+
+pub use crate::ai_client_apis::cohere::embeddings::{
+    CohereClientError, CohereEmbedder, CohereEmbeddingInputType, CohereEmbeddingModel,
+};
+pub use crate::ai_client_apis::openai::embeddings::{
+    OpenAiEmbedder, OpenAiEmbedderError, OpenAiEmbeddingModel,
+};
+pub use crate::embeddings::{
+    AgnosticEmbeddingError, Embedder, EmbeddingBatch, EmbeddingProvider, EmbeddingUsage,
+};
+pub use crate::diversification::{SelectionStrategy, StopCondition, select_diverse};
 
 #[derive(Clone, Copy)]
 pub enum AiCompletionInputs<'a> {

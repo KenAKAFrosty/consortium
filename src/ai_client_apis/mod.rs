@@ -1,4 +1,5 @@
 pub mod claude;
+pub mod cohere;
 pub mod deepseek;
 pub mod gemini;
 pub mod kimik2;

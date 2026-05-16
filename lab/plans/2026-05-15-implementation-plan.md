@@ -115,15 +115,40 @@ Provider behavior, public API surface, and wire shape did not change. Test matri
 
 ### M3 — Embedding + Diversification
 
-New module `src/diversification/`:
+**Direction change (recorded 2026-05-15):** the original M3 framing was "one `Embedder` trait with an `OpenAiEmbedder` reusing the OpenAI HTTP client." That single-provider seed is too forgiving — embedding abstractions calcify around the first provider's shape fast. M3 is reframed to land Cohere and OpenAI as first-class embedders together, so the agnostic boundary has to survive two providers with different model families, dimensions, and request shapes from day one. See [2026-05-15 — M3 Multi-Provider Embedding Direction](../journal/2026-05-15-m3-multi-provider-embedding.md).
 
-- `trait Embedder { async fn embed(&self, prompts: &[String]) -> Result<Vec<Vec<f32>>, _> }` — pluggable per the locked-in decision.
-- One initial impl: `OpenAiEmbedder` (text-embedding-3-small) reusing the OpenAI HTTP client.
-- Cosine similarity + running-centroid helpers.
-- `enum SelectionStrategy { Centroid, FarthestPointSampling }`.
-- `struct StopCondition { max_n: Option<usize>, similarity_tripwire: Option<f32> }`.
-- `fn select_diverse(embeddings, strategy, stop) -> Vec<usize>` returning indices into the input set.
-- **Verify:** synthetic-2D-embedding unit tests (clusters at the corners of a square + noise) confirm corner-picking for both strategies; tripwire and `max_n` each tested in isolation.
+**M3a — Embedding abstraction + Cohere seed + OpenAI seed + selection core.**
+
+New modules:
+
+- `src/embeddings/mod.rs` — agnostic boundary:
+  - `pub trait Embedder { async fn embed(&self, inputs: &[String]) -> Result<EmbeddingBatch, AgnosticEmbeddingError>; }` (native async fn in trait; static dispatch only).
+  - `pub enum EmbeddingProvider { Cohere, OpenAi }`.
+  - `pub enum AgnosticEmbeddingError` (thiserror) — same variant set as `AgnosticCompletionError`: `Transport`, `Deserialize`, `Auth { message }`, `RateLimited { retry_after, message }`, `InvalidRequest { message }`, `ServerError { status, message }`, `MalformedResponse { reason }`. All variants carry `provider: EmbeddingProvider`.
+  - `pub struct EmbeddingBatch { pub vectors: Vec<Vec<f32>>, pub usage: EmbeddingUsage }`.
+  - `pub struct EmbeddingUsage { pub input_tokens: u64 }` (room to add `model_used`, `request_id`, etc. without breaking `EmbeddingBatch`).
+  - Crate-private `cohere_embedding_failure_to_agnostic` and `openai_embedding_failure_to_agnostic` mappers (mirrors the completions pattern).
+- `src/ai_client_apis/cohere/mod.rs` + `embeddings.rs` — `CohereEmbedder` with `new` / `new_with_base_url` / `from_env` (reads `COHERE_API_KEY`) / `from_env_with_base_url`, builder methods `with_model` / `with_input_type`. Typed `CohereEmbeddingModel { EmbedEnglishV3, EmbedMultilingualV3, EmbedEnglishLightV3, Custom(String) }` with `as_api_str` / `Display` / `Serialize`. Typed `CohereEmbeddingInputType { SearchDocument, SearchQuery, Classification, Clustering }` with `#[serde(rename_all = "snake_case")] Serialize`. `POST /v2/embed` with `Authorization: Bearer`. Request body `{model, input_type, texts, embedding_types: ["float"]}`. Response `{embeddings: {float: [[...]]}, meta: {billed_units: {input_tokens}}}`. `CohereEmbeddingFailure` typed enum impls `FailureFromStatus` so the shared status mapping in `src/ai_client_apis/shared.rs` is reused.
+- `src/ai_client_apis/openai/embeddings.rs` — `OpenAiEmbedder` with the same four-constructor shape and `with_model` builder. Typed `OpenAiEmbeddingModel { TextEmbedding3Small, TextEmbedding3Large, TextEmbeddingAda002, Custom(String) }`. `POST /v1/embeddings` reusing the existing OpenAI bearer-auth pattern. Request `{model, input}`. Response `{data: [{embedding}], usage: {prompt_tokens}}`. `OpenAiEmbeddingFailure` impls `FailureFromStatus`.
+- `src/diversification/mod.rs` — provider-agnostic selection over `&[Vec<f32>]`:
+  - `pub enum SelectionStrategy { Centroid, FarthestPointSampling }`.
+  - `pub struct StopCondition { pub max_n: Option<usize>, pub similarity_tripwire: Option<f32> }`.
+  - `pub fn select_diverse(embeddings: &[Vec<f32>], strategy: SelectionStrategy, stop: StopCondition) -> Vec<usize>` returning indices into the input. Centroid: running-mean-then-pick-least-similar-to-mean. FPS: pick-farthest-from-nearest-already-selected.
+  - Private `cosine_similarity` helper.
+
+Defaults:
+
+- Cohere: `embed-english-v3.0` + `search_document` input type. **Not** `embed-v4.0` (multimodal) — text embeddings only in M3a per direction change.
+- OpenAI: `text-embedding-3-small`.
+
+Batching: each `embed` call makes one HTTP request. Callers must chunk before the per-provider per-request input limit (OpenAI: 2048, Cohere: 96 for v3). Auto-chunking is a future M3b candidate.
+
+Tests:
+
+- Provider-local `mockito` tests per embedder: success / auth / rate-limit-with-Retry-After / invalid-request / server-error / malformed-JSON / empty-embeddings-`MalformedResponse` / model-serialization. Plus one `#[ignore]` live test per provider gated on the respective env var.
+- Provider-agnostic synthetic-2D selection tests: hand-built clusters at corners of a square; both `Centroid` and `FarthestPointSampling` strategies pick one representative per cluster when `max_n` matches the cluster count. Plus `max_n` and `similarity_tripwire` each tested in isolation.
+
+**M3b (deferred, not in this slice).** Auto-chunking inside `Embedder::embed` with backpressure. Multimodal embedding support (Cohere `embed-v4.0` / OpenAI image-embedding endpoints if they emerge). Additional providers (Voyage, Mixedbread, etc.) as motivated. Embedding-side retry helper analogous to the completions path if real-world rate limits make it necessary.
 
 ### M4 — Judge Phase
 

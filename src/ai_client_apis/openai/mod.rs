@@ -1,3 +1,5 @@
+pub mod embeddings;
+
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
