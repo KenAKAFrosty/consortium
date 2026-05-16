@@ -17,6 +17,7 @@ Journal entries are compact lab notes. They should record what was tried, what w
 - [2026-05-15 — OpenAI Seed Shape For M2](./2026-05-15-openai-seed-shape.md)
 - [2026-05-15 — Claude Seed And Typed Model Contract](./2026-05-15-claude-seed-and-typed-models.md)
 - [2026-05-15 — Gemini Seed And Extraction Checkpoint](./2026-05-15-gemini-seed-and-extraction-checkpoint.md)
+- [2026-05-15 — Stabilization: Secrets, Backon, And Constructor Shape](./2026-05-15-stabilization-secrets-and-backon.md)
 
 ## See Also
 

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
@@ -8,26 +9,34 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 pub struct GeminiClient {
     http: reqwest::Client,
     base_url: String,
-    api_key: String,
+    api_key: SecretString,
 }
 
 impl GeminiClient {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: impl Into<SecretString>) -> Self {
+        Self::new_with_base_url(api_key, DEFAULT_BASE_URL)
+    }
+
+    pub fn new_with_base_url(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
-            base_url: DEFAULT_BASE_URL.to_string(),
-            api_key,
+            base_url: base_url.into(),
+            api_key: api_key.into(),
         }
     }
 
     pub fn from_env() -> Result<Self, GeminiClientError> {
-        let key = std::env::var("GEMINI_API_KEY").map_err(|_| GeminiClientError::MissingApiKey)?;
-        Ok(Self::new(key))
+        Self::from_env_with_base_url(DEFAULT_BASE_URL)
     }
 
-    pub fn with_base_url(mut self, base_url: String) -> Self {
-        self.base_url = base_url;
-        self
+    pub fn from_env_with_base_url(
+        base_url: impl Into<String>,
+    ) -> Result<Self, GeminiClientError> {
+        let key = std::env::var("GEMINI_API_KEY").map_err(|_| GeminiClientError::MissingApiKey)?;
+        Ok(Self::new_with_base_url(key, base_url))
     }
 }
 
@@ -37,19 +46,11 @@ pub enum GeminiClientError {
     MissingApiKey,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum GeminiRole {
     User,
     Model,
-}
-
-impl GeminiRole {
-    fn as_wire_str(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Model => "model",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +176,7 @@ struct WireRequest<'a> {
 
 #[derive(Serialize)]
 struct WireContentReq<'a> {
-    role: &'a str,
+    role: GeminiRole,
     parts: Vec<WirePartReq<'a>>,
 }
 
@@ -238,7 +239,7 @@ pub async fn gemini_get_completion(
         .messages
         .iter()
         .map(|m| WireContentReq {
-            role: m.role.as_wire_str(),
+            role: m.role,
             parts: vec![WirePartReq { text: &m.content }],
         })
         .collect();
@@ -274,7 +275,7 @@ pub async fn gemini_get_completion(
     let response = client
         .http
         .post(&url)
-        .header("x-goog-api-key", &client.api_key)
+        .header("x-goog-api-key", client.api_key.expose_secret())
         .json(&body)
         .send()
         .await
@@ -383,7 +384,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = GeminiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = GeminiClient::new_with_base_url("test-key".to_string(), server.url());
         let success = gemini_get_completion(&client, &sample_command())
             .await
             .expect("expected success");
@@ -415,7 +416,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = GeminiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = GeminiClient::new_with_base_url("test-key".to_string(), server.url());
         let success = gemini_get_completion(&client, &sample_command())
             .await
             .expect("expected success");
@@ -432,7 +433,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = GeminiClient::new("bad-key".to_string()).with_base_url(server.url());
+        let client = GeminiClient::new_with_base_url("bad-key".to_string(), server.url());
         let err = gemini_get_completion(&client, &sample_command())
             .await
             .expect_err("expected auth failure");
@@ -455,7 +456,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = GeminiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = GeminiClient::new_with_base_url("test-key".to_string(), server.url());
         let err = gemini_get_completion(&client, &sample_command())
             .await
             .expect_err("expected rate limit");
@@ -481,7 +482,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = GeminiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = GeminiClient::new_with_base_url("test-key".to_string(), server.url());
         let err = gemini_get_completion(&client, &sample_command())
             .await
             .expect_err("expected invalid request");
@@ -503,7 +504,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = GeminiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = GeminiClient::new_with_base_url("test-key".to_string(), server.url());
         let err = gemini_get_completion(&client, &sample_command())
             .await
             .expect_err("expected server error");
@@ -526,7 +527,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = GeminiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = GeminiClient::new_with_base_url("test-key".to_string(), server.url());
         let err = gemini_get_completion(&client, &sample_command())
             .await
             .expect_err("expected deserialize failure");
@@ -545,7 +546,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = GeminiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = GeminiClient::new_with_base_url("test-key".to_string(), server.url());
         let err = gemini_get_completion(&client, &sample_command())
             .await
             .expect_err("expected malformed");
@@ -575,7 +576,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = GeminiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = GeminiClient::new_with_base_url("test-key".to_string(), server.url());
         let err = gemini_get_completion(&client, &sample_command())
             .await
             .expect_err("expected malformed");

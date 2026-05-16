@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -9,27 +10,35 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub struct ClaudeClient {
     http: reqwest::Client,
     base_url: String,
-    api_key: String,
+    api_key: SecretString,
 }
 
 impl ClaudeClient {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: impl Into<SecretString>) -> Self {
+        Self::new_with_base_url(api_key, DEFAULT_BASE_URL)
+    }
+
+    pub fn new_with_base_url(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
-            base_url: DEFAULT_BASE_URL.to_string(),
-            api_key,
+            base_url: base_url.into(),
+            api_key: api_key.into(),
         }
     }
 
     pub fn from_env() -> Result<Self, ClaudeClientError> {
-        let key =
-            std::env::var("ANTHROPIC_API_KEY").map_err(|_| ClaudeClientError::MissingApiKey)?;
-        Ok(Self::new(key))
+        Self::from_env_with_base_url(DEFAULT_BASE_URL)
     }
 
-    pub fn with_base_url(mut self, base_url: String) -> Self {
-        self.base_url = base_url;
-        self
+    pub fn from_env_with_base_url(
+        base_url: impl Into<String>,
+    ) -> Result<Self, ClaudeClientError> {
+        let key =
+            std::env::var("ANTHROPIC_API_KEY").map_err(|_| ClaudeClientError::MissingApiKey)?;
+        Ok(Self::new_with_base_url(key, base_url))
     }
 }
 
@@ -39,19 +48,11 @@ pub enum ClaudeClientError {
     MissingApiKey,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ClaudeRole {
     User,
     Assistant,
-}
-
-impl ClaudeRole {
-    fn as_wire_str(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Assistant => "assistant",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,7 +180,7 @@ struct WireRequest<'a> {
 
 #[derive(Serialize)]
 struct WireMessage<'a> {
-    role: &'a str,
+    role: ClaudeRole,
     content: &'a str,
 }
 
@@ -213,7 +214,7 @@ pub async fn claude_get_completion(
     let mut wire_messages: Vec<WireMessage<'_>> = Vec::with_capacity(command.messages.len());
     for msg in &command.messages {
         wire_messages.push(WireMessage {
-            role: msg.role.as_wire_str(),
+            role: msg.role,
             content: &msg.content,
         });
     }
@@ -230,7 +231,7 @@ pub async fn claude_get_completion(
     let response = client
         .http
         .post(&url)
-        .header("x-api-key", &client.api_key)
+        .header("x-api-key", client.api_key.expose_secret())
         .header("anthropic-version", ANTHROPIC_VERSION)
         .json(&body)
         .send()
@@ -329,7 +330,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = ClaudeClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = ClaudeClient::new_with_base_url("test-key".to_string(), server.url());
         let success = claude_get_completion(&client, &sample_command())
             .await
             .expect("expected success");
@@ -357,7 +358,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = ClaudeClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = ClaudeClient::new_with_base_url("test-key".to_string(), server.url());
         let success = claude_get_completion(&client, &sample_command())
             .await
             .expect("expected success");
@@ -374,7 +375,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = ClaudeClient::new("bad-key".to_string()).with_base_url(server.url());
+        let client = ClaudeClient::new_with_base_url("bad-key".to_string(), server.url());
         let err = claude_get_completion(&client, &sample_command())
             .await
             .expect_err("expected auth failure");
@@ -397,7 +398,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = ClaudeClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = ClaudeClient::new_with_base_url("test-key".to_string(), server.url());
         let err = claude_get_completion(&client, &sample_command())
             .await
             .expect_err("expected rate limit");
@@ -423,7 +424,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = ClaudeClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = ClaudeClient::new_with_base_url("test-key".to_string(), server.url());
         let err = claude_get_completion(&client, &sample_command())
             .await
             .expect_err("expected invalid request");
@@ -445,7 +446,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = ClaudeClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = ClaudeClient::new_with_base_url("test-key".to_string(), server.url());
         let err = claude_get_completion(&client, &sample_command())
             .await
             .expect_err("expected server-class failure");
@@ -471,7 +472,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = ClaudeClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = ClaudeClient::new_with_base_url("test-key".to_string(), server.url());
         let err = claude_get_completion(&client, &sample_command())
             .await
             .expect_err("expected server error");
@@ -494,7 +495,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = ClaudeClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = ClaudeClient::new_with_base_url("test-key".to_string(), server.url());
         let err = claude_get_completion(&client, &sample_command())
             .await
             .expect_err("expected deserialize failure");
@@ -516,7 +517,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = ClaudeClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = ClaudeClient::new_with_base_url("test-key".to_string(), server.url());
         let err = claude_get_completion(&client, &sample_command())
             .await
             .expect_err("expected malformed");

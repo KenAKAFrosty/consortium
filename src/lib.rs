@@ -1,8 +1,8 @@
 mod ai_client_apis;
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use backon::{BackoffBuilder, ExponentialBuilder};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -69,6 +69,13 @@ pub enum AgnosticCompletionError {
         #[source]
         source: reqwest::Error,
     },
+    /// Provider HTTP response JSON could not be decoded against the wire schema.
+    /// Non-transient: re-issuing the same request would yield the same payload.
+    ///
+    /// This is **not** the right variant for malformed structured text produced by
+    /// the LLM itself (e.g., a model that violated a requested JSON schema inside
+    /// its content). When that becomes a modeled concern, add a separate variant
+    /// (e.g., `ModelOutputSchemaViolation`) rather than overloading this one.
     #[error("{provider:?}: response deserialization failed: {source}")]
     Deserialize {
         provider: ProviderKind,
@@ -97,6 +104,12 @@ pub enum AgnosticCompletionError {
         status: u16,
         message: Option<String>,
     },
+    /// Provider returned a valid-JSON response that parsed against the wire schema
+    /// but failed a semantic invariant — e.g., 200 OK with `choices: []`, or a
+    /// candidate with no text parts. Non-transient.
+    ///
+    /// Like `Deserialize`, this is about provider-wire-protocol violations, not
+    /// about whether the LLM's text content satisfied a downstream contract.
     #[error("{provider:?}: response malformed: {reason}")]
     MalformedResponse {
         provider: ProviderKind,
@@ -294,85 +307,23 @@ fn convert_raw_result_to_agnostic_output(
     }
 }
 
-const DEFAULT_MAX_ATTEMPTS: u32 = 3;
-const DEFAULT_BASE_DELAY: Duration = Duration::from_millis(100);
+const MAX_RETRIES: usize = 2;
+const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-struct RetryOutcome {
-    result: Result<AgnosticCompletionOutput, AgnosticCompletionError>,
-    retries: u32,
-    latency: Duration,
-}
-
-async fn run_with_retry<F, Fut>(
-    max_attempts: u32,
-    base_delay: Duration,
-    mut operation: F,
-) -> RetryOutcome
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<AgnosticCompletionOutput, AgnosticCompletionError>>,
-{
-    let start = Instant::now();
-    let mut retries: u32 = 0;
-    loop {
-        match operation().await {
-            Ok(output) => {
-                return RetryOutcome {
-                    result: Ok(output),
-                    retries,
-                    latency: start.elapsed(),
-                };
-            }
-            Err(err) => {
-                let can_retry = err.is_transient() && retries + 1 < max_attempts;
-                if !can_retry {
-                    return RetryOutcome {
-                        result: Err(err),
-                        retries,
-                        latency: start.elapsed(),
-                    };
-                }
-                let delay = delay_for_attempt(&err, retries, base_delay);
-                tokio::time::sleep(delay).await;
-                retries += 1;
-            }
-        }
+fn retry_after_override(err: &AgnosticCompletionError) -> Option<Duration> {
+    match err {
+        AgnosticCompletionError::RateLimited {
+            retry_after: Some(ra),
+            ..
+        } => Some(*ra),
+        _ => None,
     }
-}
-
-fn delay_for_attempt(err: &AgnosticCompletionError, attempt: u32, base: Duration) -> Duration {
-    if let AgnosticCompletionError::RateLimited {
-        retry_after: Some(ra),
-        ..
-    } = err
-    {
-        return *ra;
-    }
-    let exp = attempt.min(6);
-    let backoff_ms = (base.as_millis() as u64).saturating_mul(1u64 << exp);
-    let jitter_ms = jitter_within(backoff_ms / 4);
-    Duration::from_millis(backoff_ms.saturating_add(jitter_ms))
-}
-
-static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn jitter_within(max_ms: u64) -> u64 {
-    if max_ms == 0 {
-        return 0;
-    }
-    let mut z = JITTER_COUNTER
-        .fetch_add(1, Ordering::Relaxed)
-        .wrapping_add(0x9E3779B97F4A7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^= z >> 31;
-    z % (max_ms + 1)
 }
 
 fn build_attempt<'a, F, Fut>(
     provider: ProviderKind,
     input_index: usize,
-    raw_op: F,
+    mut raw_op: F,
 ) -> BoxFuture<'a, ProviderAttempt>
 where
     F: FnMut() -> Fut + Send + 'a,
@@ -381,13 +332,37 @@ where
         + 'a,
 {
     async move {
-        let outcome = run_with_retry(DEFAULT_MAX_ATTEMPTS, DEFAULT_BASE_DELAY, raw_op).await;
+        let start = Instant::now();
+        let mut retries: u32 = 0;
+        let mut backoff = ExponentialBuilder::default()
+            .with_min_delay(BASE_RETRY_DELAY)
+            .with_max_times(MAX_RETRIES)
+            .with_jitter()
+            .build();
+
+        let result = loop {
+            match raw_op().await {
+                Ok(output) => break Ok(output),
+                Err(err) => {
+                    if !err.is_transient() {
+                        break Err(err);
+                    }
+                    let Some(backoff_delay) = backoff.next() else {
+                        break Err(err);
+                    };
+                    let delay = retry_after_override(&err).unwrap_or(backoff_delay);
+                    tokio::time::sleep(delay).await;
+                    retries += 1;
+                }
+            }
+        };
+
         ProviderAttempt {
             provider,
             input_index,
-            result: outcome.result,
-            retries: outcome.retries,
-            latency: outcome.latency,
+            result,
+            retries,
+            latency: start.elapsed(),
         }
     }
     .boxed()
@@ -460,7 +435,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = OpenAiClient::new("k".to_string()).with_base_url(server.url());
+        let client = OpenAiClient::new_with_base_url("k".to_string(), server.url());
         let cmd_a = OpenAiCompletionCommand {
             model: OpenAiModel::Gpt4oMini,
             system_prompt: None,
@@ -523,7 +498,7 @@ mod tests {
             .create_async()
             .await;
 
-        let gemini_client = GeminiClient::new("k".to_string()).with_base_url(server.url());
+        let gemini_client = GeminiClient::new_with_base_url("k".to_string(), server.url());
         let gemini_command = GeminiCompletionCommand {
             model: GeminiModel::Gemini15Flash,
             system_prompt: None,
@@ -572,7 +547,7 @@ mod tests {
             .create_async()
             .await;
 
-        let claude_client = ClaudeClient::new("k".to_string()).with_base_url(server.url());
+        let claude_client = ClaudeClient::new_with_base_url("k".to_string(), server.url());
         let claude_command = ClaudeCompletionCommand {
             model: ClaudeModel::Sonnet46,
             system_prompt: None,
@@ -621,7 +596,7 @@ mod tests {
             .create_async()
             .await;
 
-        let openai_client = OpenAiClient::new("k".to_string()).with_base_url(server.url());
+        let openai_client = OpenAiClient::new_with_base_url("k".to_string(), server.url());
         let openai_command = OpenAiCompletionCommand {
             model: OpenAiModel::Gpt4oMini,
             system_prompt: None,
@@ -667,7 +642,7 @@ mod tests {
             .create_async()
             .await;
 
-        let openai_client = OpenAiClient::new("k".to_string()).with_base_url(server.url());
+        let openai_client = OpenAiClient::new_with_base_url("k".to_string(), server.url());
         let openai_command = OpenAiCompletionCommand {
             model: OpenAiModel::Gpt4oMini,
             system_prompt: None,

@@ -36,4 +36,5 @@ Use it to capture meaningful directions, experiments, decisions, and course corr
 - [OpenAI Seed Shape For M2](./journal/2026-05-15-openai-seed-shape.md)
 - [Claude Seed And Typed Model Contract](./journal/2026-05-15-claude-seed-and-typed-models.md)
 - [Gemini Seed And Extraction Checkpoint](./journal/2026-05-15-gemini-seed-and-extraction-checkpoint.md)
+- [Stabilization: Secrets, Backon, And Constructor Shape](./journal/2026-05-15-stabilization-secrets-and-backon.md)
 - [Decision 0001: Owned Types At Async Boundaries](./decisions/0001-owned-types-at-async-boundaries.md)

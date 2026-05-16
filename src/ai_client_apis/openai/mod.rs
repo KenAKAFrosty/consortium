@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
@@ -8,26 +9,34 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 pub struct OpenAiClient {
     http: reqwest::Client,
     base_url: String,
-    api_key: String,
+    api_key: SecretString,
 }
 
 impl OpenAiClient {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: impl Into<SecretString>) -> Self {
+        Self::new_with_base_url(api_key, DEFAULT_BASE_URL)
+    }
+
+    pub fn new_with_base_url(
+        api_key: impl Into<SecretString>,
+        base_url: impl Into<String>,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
-            base_url: DEFAULT_BASE_URL.to_string(),
-            api_key,
+            base_url: base_url.into(),
+            api_key: api_key.into(),
         }
     }
 
     pub fn from_env() -> Result<Self, OpenAiClientError> {
-        let key = std::env::var("OPENAI_API_KEY").map_err(|_| OpenAiClientError::MissingApiKey)?;
-        Ok(Self::new(key))
+        Self::from_env_with_base_url(DEFAULT_BASE_URL)
     }
 
-    pub fn with_base_url(mut self, base_url: String) -> Self {
-        self.base_url = base_url;
-        self
+    pub fn from_env_with_base_url(
+        base_url: impl Into<String>,
+    ) -> Result<Self, OpenAiClientError> {
+        let key = std::env::var("OPENAI_API_KEY").map_err(|_| OpenAiClientError::MissingApiKey)?;
+        Ok(Self::new_with_base_url(key, base_url))
     }
 }
 
@@ -236,7 +245,7 @@ pub async fn openai_get_completion(
     let response = client
         .http
         .post(&url)
-        .bearer_auth(&client.api_key)
+        .bearer_auth(client.api_key.expose_secret())
         .json(&body)
         .send()
         .await
@@ -305,7 +314,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = OpenAiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), server.url());
         let success = openai_get_completion(&client, &sample_command())
             .await
             .expect("expected success");
@@ -325,7 +334,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = OpenAiClient::new("bad-key".to_string()).with_base_url(server.url());
+        let client = OpenAiClient::new_with_base_url("bad-key".to_string(), server.url());
         let err = openai_get_completion(&client, &sample_command())
             .await
             .expect_err("expected auth failure");
@@ -347,7 +356,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = OpenAiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), server.url());
         let err = openai_get_completion(&client, &sample_command())
             .await
             .expect_err("expected auth failure");
@@ -365,7 +374,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = OpenAiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), server.url());
         let err = openai_get_completion(&client, &sample_command())
             .await
             .expect_err("expected rate limit");
@@ -387,7 +396,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = OpenAiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), server.url());
         let err = openai_get_completion(&client, &sample_command())
             .await
             .expect_err("expected invalid request");
@@ -409,7 +418,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = OpenAiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), server.url());
         let err = openai_get_completion(&client, &sample_command())
             .await
             .expect_err("expected server error");
@@ -420,6 +429,19 @@ mod tests {
             }
             other => panic!("expected ServerError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn debug_output_redacts_api_key() {
+        let client = OpenAiClient::new_with_base_url(
+            "super-secret-openai-key".to_string(),
+            "https://example.test",
+        );
+        let debug = format!("{client:?}");
+        assert!(
+            !debug.contains("super-secret-openai-key"),
+            "Debug output must not leak api_key: {debug}"
+        );
     }
 
     #[test]
@@ -451,7 +473,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = OpenAiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), server.url());
         let err = openai_get_completion(&client, &sample_command())
             .await
             .expect_err("empty choices must surface as a typed failure");
@@ -473,7 +495,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = OpenAiClient::new("test-key".to_string()).with_base_url(server.url());
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), server.url());
         let err = openai_get_completion(&client, &sample_command())
             .await
             .expect_err("expected deserialize failure");
