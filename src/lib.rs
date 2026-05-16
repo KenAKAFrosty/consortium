@@ -1,4 +1,5 @@
 mod ai_client_apis;
+pub mod dataset;
 pub mod diversification;
 pub mod embeddings;
 pub mod judge;
@@ -45,6 +46,10 @@ pub use crate::orchestrator::{
     ConsortiumOutcome, ConsortiumSlot, CrossModelCandidate, CrossModelPhaseOutcome,
     JudgeOutcome, JudgeProvider, JudgedSample, ModelPhaseOutcome, PhaseOneWinner,
     PhaseTwoWinner, SampleAttempt, consortium_completion,
+};
+pub use crate::dataset::{
+    DatasetBuildError, DatasetBuilder, DatasetRow, DatasetRun, DatasetRunError, PromptOutcome,
+    PromptRunError, RowSkipReason, RowStatus, RowWinner, SkipReason, SlotTemplate, write_jsonl,
 };
 
 #[derive(Clone, Copy)]
