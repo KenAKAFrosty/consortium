@@ -172,13 +172,21 @@ Removed from `src/lib.rs` as part of this slice: the M0-era `ORDERED_JUDGEMENT_S
 
 ### M5 — Two-Phase Consortium
 
-The empty `consortium_completion` (`src/lib.rs:157`) becomes the orchestrator:
+**M5a — Single-prompt typed-outcome orchestrator: landed.** Lives in `src/orchestrator/mod.rs`; re-exported from the crate root. See [2026-05-15 — M5a Two-Phase Consortium Orchestrator](../journal/2026-05-15-m5a-two-phase-orchestrator.md).
 
-- **Phase 1 (intra-model):** for each model, sample N completions; run multi-judge ranking within that model; keep the winner.
-- **Phase 2 (inter-model):** feed per-model winners into cross-model multi-judge ranking; emit the overall best.
-- Surface intermediate results via an `mpsc` channel or a callback trait (the comment at `src/lib.rs:161` mentions this hook intent) so callers can stream phase-1 winners as they finalize.
-- Preserve per-provider and per-judge failures in the orchestration result instead of flattening them away; if a prompt fails end-to-end, that becomes a first-class prompt outcome rather than an omitted row.
-- **Verify:** one `--ignored` end-to-end test that exercises both phases against real APIs.
+- `consortium_completion(slots, judges) -> ConsortiumOutcome`. `ConsortiumSlot { input: AiCompletionInputs, model_label: String, samples: usize }` configures each model entry; `JudgeProvider` is a tiny orchestrator-level trait (`label`, `invoke -> BoxFuture<...>`) so the same judge can be called once per slot in Phase 1 and once in Phase 2 — the M4 `src/judge/` primitives stay closure-based and provider-agnostic.
+- **Phase 1 (intra-model):** one mega `multi_infer` fan-out across every `(slot, sample)` pair, intentionally exercising M1's duplicate `input_index` support. Attempts are binned by slot, candidates are assembled from successful samples, blind ids are assigned, judges are invoked once per slot, Borda is aggregated, and the winner is resolved back to a slot-local `sample_index`.
+- **Phase 2 (inter-model):** per-slot winners become cross-model candidates; blind ids and judges run the same way; the winner resolves back to a `model_index` in `phase_one`.
+- **Singleton short-circuits:** a slot with one surviving sample, or a cross-model phase with one surviving slot, picks the trivial winner without invoking judges. Blind ids are still assigned up front so `judged` / `candidates` stay populated and the BlindId-resolution contract is uniform.
+- **Failure preservation** is first-class at every layer: failed `ProviderAttempt`s stay in `ModelPhaseOutcome.samples`; failed judge calls (`JudgementError::Provider` and `JudgementError::Parse`) stay in `JudgeOutcome.result`; a slot with zero surviving samples reports `winner = None` with full `samples` retained; a model that fails entirely is absent from `CrossModelPhaseOutcome.candidates` but visible in `phase_one` with `winner = None`.
+- **Explicit blind-id provenance** is exposed in the public outcome (post-review fix): `ModelPhaseOutcome.judged: Vec<JudgedSample { blind_id, sample_index, content }>` and `CrossModelCandidate { blind_id, model_index, provider, model_label, content }`. Any preserved `BlindId` from a `JudgeOutcome.result` or `AggregatedRanking` — winning or not — resolves back to a concrete sample / model slot without callers relying on hidden ordering conventions.
+- **Verified:** mockito-mocked providers and closure-based test judges drive `cargo test --lib` to 99 passed / 0 failed / 5 ignored. Two new tests: a happy-path 2-slot × 2-sample × 2-judge run that verifies winners, aggregation, and traces a non-winning blind id from a judge result back through `judged` and `candidates`; and a partial-failure run that asserts failed provider attempts and a failing judge are both preserved (not collapsed) while the surviving slot still produces a winner.
+
+**M5b (deferred, not in this slice).** Parallelize judge invocation across slots and across judges within a phase using `FuturesUnordered`. Currently judges run sequentially — the correctness contract is settled, but concurrency is a follow-up once the latency budget is real.
+
+**M5c (deferred, not in this slice).** Streaming surface — likely `mpsc::Sender<PhaseEvent>` driven off the same orchestrator, emitting one event per finalized `ModelPhaseOutcome` plus the final `CrossModelPhaseOutcome`. The typed `ConsortiumOutcome` stays the canonical surface; streaming is an additive view onto it. The originally proposed `--ignored` end-to-end test against real APIs lives at this slice (the in-memory shape doesn't need it; the streaming wiring does).
+
+**M5d (deferred, not in this slice).** Multi-prompt orchestration. `consortium_completion` is single-prompt; multi-prompt fan-out is M6 / DatasetBuilder territory, built on top of this primitive.
 
 ### M6 — Dataset Pipeline + JSONL Writer
 

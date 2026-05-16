@@ -2,6 +2,7 @@ mod ai_client_apis;
 pub mod diversification;
 pub mod embeddings;
 pub mod judge;
+pub mod orchestrator;
 
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,11 @@ pub use crate::judge::{
     JudgementError, JudgementParseError, OrderedJudgement, aggregate_rankings,
     assign_blind_ids, build_judge_user_message, judge_rank, parse_ordered_judgement,
 };
+pub use crate::orchestrator::{
+    ConsortiumOutcome, ConsortiumSlot, CrossModelCandidate, CrossModelPhaseOutcome,
+    JudgeOutcome, JudgeProvider, JudgedSample, ModelPhaseOutcome, PhaseOneWinner,
+    PhaseTwoWinner, SampleAttempt, consortium_completion,
+};
 
 #[derive(Clone, Copy)]
 pub enum AiCompletionInputs<'a> {
@@ -59,6 +65,18 @@ pub struct MultiAiCompletionInputs<'a> {
 impl<'a> MultiAiCompletionInputs<'a> {
     pub fn new(completion_inputs: &'a [AiCompletionInputs<'a>]) -> Self {
         Self { completion_inputs }
+    }
+}
+
+impl<'a> AiCompletionInputs<'a> {
+    /// Identify which provider this input targets. Useful to record provenance
+    /// before any HTTP attempt has produced a [`ProviderAttempt`].
+    pub fn provider(&self) -> ProviderKind {
+        match self {
+            AiCompletionInputs::Claude(_, _) => ProviderKind::Claude,
+            AiCompletionInputs::OpenAi(_, _) => ProviderKind::OpenAi,
+            AiCompletionInputs::Gemini(_, _) => ProviderKind::Gemini,
+        }
     }
 }
 
@@ -707,7 +725,3 @@ mod tests {
     }
 }
 
-// `consortium_completion` (the two-phase orchestrator promised by the crate's
-// namesake feature) is M5 work — see `lab/plans/2026-05-15-implementation-plan.md`.
-// M4 provides the judge primitives (`src/judge/`); M5 wires fan-out + judge into
-// the actual phase-1/phase-2 orchestration.

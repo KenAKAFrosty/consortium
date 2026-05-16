@@ -39,4 +39,5 @@ Use it to capture meaningful directions, experiments, decisions, and course corr
 - [Stabilization: Secrets, Backon, And Constructor Shape](./journal/2026-05-15-stabilization-secrets-and-backon.md)
 - [M3 Multi-Provider Embedding Direction](./journal/2026-05-15-m3-multi-provider-embedding.md)
 - [M4 Judge Layer Corrections](./journal/2026-05-15-m4-judge-layer.md)
+- [M5a Two-Phase Consortium Orchestrator](./journal/2026-05-15-m5a-two-phase-orchestrator.md)
 - [Decision 0001: Owned Types At Async Boundaries](./decisions/0001-owned-types-at-async-boundaries.md)
