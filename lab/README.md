@@ -41,4 +41,5 @@ Use it to capture meaningful directions, experiments, decisions, and course corr
 - [M4 Judge Layer Corrections](./journal/2026-05-15-m4-judge-layer.md)
 - [M5a Two-Phase Consortium Orchestrator](./journal/2026-05-15-m5a-two-phase-orchestrator.md)
 - [M6a Dataset Builder And JSONL Pipeline](./journal/2026-05-15-m6a-dataset-builder-and-jsonl-pipeline.md)
+- [M6b Bounded Per-Prompt Parallelism](./journal/2026-05-16-m6b-bounded-per-prompt-parallelism.md)
 - [Decision 0001: Owned Types At Async Boundaries](./decisions/0001-owned-types-at-async-boundaries.md)

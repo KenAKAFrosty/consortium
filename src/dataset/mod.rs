@@ -31,17 +31,31 @@
 //!   [`PromptOutcome`] — `Completed`, `Skipped`, or `Failed`. A failing
 //!   prompt never terminates the stream; subsequent prompts continue.
 //!
-//! ## What M6a deliberately is not
+//! ## Per-prompt parallelism (M6b)
 //!
-//! Per-prompt execution is sequential. Embedding is a single batch call
-//! (auto-chunking is M3b/M6b territory). Judge concurrency stays inherited
-//! from M5a (sequential within a phase). Streaming events (`PhaseEvent`,
-//! callback hooks) are M5c work, not M6a.
+//! [`DatasetBuilder::parallelism`] sets the maximum number of selected prompts
+//! that may be in flight at once. The default is `1` (sequential, identical to
+//! the M6a contract). Internally, [`DatasetRun::execute`] drives a bounded
+//! [`futures::stream::FuturesUnordered`] of `process_prompt` futures and uses
+//! a small `BTreeMap` reorder buffer so completed prompts that finish out of
+//! order are still emitted in original `prompt_index` order. Skipped prompts
+//! never enter the in-flight queue — they flow through the same ordered
+//! emission path at their original position.
+//!
+//! ## What M6b deliberately is not
+//!
+//! No `tokio::spawn` — concurrency is single-task cooperative, so the per-run
+//! state does not need to become `Send`. Embedding is still a single batch
+//! call (auto-chunking is M3b/M6c territory). Judge concurrency within a
+//! single prompt stays inherited from M5a (sequential within a phase).
+//! Streaming events (`PhaseEvent`, callback hooks) are M5c work.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{self, FuturesUnordered, Stream, StreamExt};
 use serde::Serialize;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -243,12 +257,14 @@ pub struct DatasetBuilder<E: Embedder> {
     embedder: E,
     selection: SelectionStrategy,
     stop_condition: StopCondition,
+    parallelism: usize,
 }
 
 impl<E: Embedder> DatasetBuilder<E> {
     /// Start a new builder. Defaults: no slots, no judges,
-    /// [`SelectionStrategy::Centroid`], and a [`StopCondition`] that does not
-    /// filter anything (`max_n = None`, `similarity_tripwire = None`).
+    /// [`SelectionStrategy::Centroid`], a [`StopCondition`] that does not
+    /// filter anything (`max_n = None`, `similarity_tripwire = None`), and
+    /// `parallelism = 1` (sequential per-prompt execution).
     pub fn new(embedder: E) -> Self {
         Self {
             slot_templates: Vec::new(),
@@ -259,6 +275,7 @@ impl<E: Embedder> DatasetBuilder<E> {
                 max_n: None,
                 similarity_tripwire: None,
             },
+            parallelism: 1,
         }
     }
 
@@ -290,14 +307,29 @@ impl<E: Embedder> DatasetBuilder<E> {
         self
     }
 
+    /// Maximum number of selected prompts that may be in flight at once
+    /// inside [`DatasetRun::execute`]. `1` is sequential and matches the
+    /// M6a behaviour; values `>1` enable bounded per-prompt concurrency
+    /// driven internally by a [`futures::stream::FuturesUnordered`].
+    /// Setting `0` is rejected eagerly by [`Self::build`] via
+    /// [`DatasetBuildError::ZeroParallelism`].
+    pub fn parallelism(mut self, parallelism: usize) -> Self {
+        self.parallelism = parallelism;
+        self
+    }
+
     /// Validate the configuration and produce a runnable [`DatasetRun`].
-    /// Fails fast on missing slots, missing judges, or zero-sample slots.
+    /// Fails fast on missing slots, missing judges, zero-sample slots, or a
+    /// zero `parallelism` setting.
     pub fn build(self) -> Result<DatasetRun<E>, DatasetBuildError> {
         if self.slot_templates.is_empty() {
             return Err(DatasetBuildError::NoSlots);
         }
         if self.judges.is_empty() {
             return Err(DatasetBuildError::NoJudges);
+        }
+        if self.parallelism == 0 {
+            return Err(DatasetBuildError::ZeroParallelism);
         }
         for (i, t) in self.slot_templates.iter().enumerate() {
             if t.samples() == 0 {
@@ -313,6 +345,7 @@ impl<E: Embedder> DatasetBuilder<E> {
             embedder: self.embedder,
             selection: self.selection,
             stop_condition: self.stop_condition,
+            parallelism: self.parallelism,
         })
     }
 }
@@ -324,6 +357,7 @@ pub struct DatasetRun<E: Embedder> {
     embedder: E,
     selection: SelectionStrategy,
     stop_condition: StopCondition,
+    parallelism: usize,
 }
 
 impl<E: Embedder> DatasetRun<E> {
@@ -383,57 +417,127 @@ impl<E: Embedder> DatasetRun<E> {
         let DatasetRun {
             slot_templates,
             judges,
+            parallelism,
             ..
         } = self;
 
         let state = StreamState {
-            slot_templates,
-            judges,
+            slot_templates: Arc::new(slot_templates),
+            judges: Arc::new(judges),
             prompts,
             selected,
-            next: 0,
+            next_to_schedule: 0,
+            next_to_emit: 0,
+            parallelism,
+            in_flight: FuturesUnordered::new(),
+            reorder_buffer: BTreeMap::new(),
         };
 
         Ok(stream::unfold(state, |mut s| async move {
-            if s.next >= s.prompts.len() {
-                return None;
+            loop {
+                if s.next_to_emit >= s.prompts.len() {
+                    // Defensive invariants: once we have emitted everything,
+                    // no buffered work and no in-flight work should remain.
+                    debug_assert!(s.reorder_buffer.is_empty());
+                    debug_assert!(s.in_flight.is_empty());
+                    return None;
+                }
+
+                // Fill phase: schedule selected prompts up to the configured
+                // in-flight cap. Skipped prompts are *not* scheduled — they
+                // wait in `prompts[i]` and emit synchronously at their slot
+                // (the emit phase handles them).
+                while s.in_flight.len() < s.parallelism && s.next_to_schedule < s.prompts.len() {
+                    let i = s.next_to_schedule;
+                    s.next_to_schedule += 1;
+                    if s.selected.contains(&i) {
+                        let templates = s.slot_templates.clone();
+                        let judges = s.judges.clone();
+                        let prompt = std::mem::take(&mut s.prompts[i]);
+                        let fut: PromptFuture = Box::pin(async move {
+                            let result = process_prompt(&templates, &judges, &prompt).await;
+                            let outcome = match result {
+                                Ok(outcome) => PromptOutcome::Completed {
+                                    prompt_index: i,
+                                    prompt,
+                                    outcome,
+                                },
+                                Err(error) => PromptOutcome::Failed {
+                                    prompt_index: i,
+                                    prompt,
+                                    error,
+                                },
+                            };
+                            (i, outcome)
+                        });
+                        s.in_flight.push(fut);
+                    }
+                }
+
+                // Emit phase: yield `next_to_emit` if it is already ready.
+                let i = s.next_to_emit;
+                if let Some(outcome) = s.reorder_buffer.remove(&i) {
+                    s.next_to_emit += 1;
+                    return Some((outcome, s));
+                }
+                if !s.selected.contains(&i) {
+                    // In-place skip: the prompt is still owned by `s.prompts`
+                    // because the fill phase intentionally does not consume
+                    // skipped slots.
+                    let prompt = std::mem::take(&mut s.prompts[i]);
+                    s.next_to_emit += 1;
+                    return Some((
+                        PromptOutcome::Skipped {
+                            prompt_index: i,
+                            prompt,
+                            reason: SkipReason::NotSelectedByDiversification,
+                        },
+                        s,
+                    ));
+                }
+
+                // `next_to_emit` is selected and not yet complete. The fill
+                // phase guarantees it has been pushed into `in_flight` (or a
+                // later completion is already buffered, which we just
+                // checked). Drive `in_flight` until something completes,
+                // then loop back through fill+emit.
+                match s.in_flight.next().await {
+                    Some((idx, outcome)) => {
+                        s.reorder_buffer.insert(idx, outcome);
+                    }
+                    None => {
+                        // Invariant violation: we have a selected prompt to
+                        // emit, but no in-flight work and no buffered result
+                        // for it. Treat as stream-end rather than panic.
+                        debug_assert!(
+                            false,
+                            "in_flight unexpectedly empty while awaiting selected prompt {i}"
+                        );
+                        return None;
+                    }
+                }
             }
-            let i = s.next;
-            s.next += 1;
-            let prompt = std::mem::take(&mut s.prompts[i]);
-
-            let outcome = if s.selected.contains(&i) {
-                match process_prompt(&s.slot_templates, &s.judges, &prompt).await {
-                    Ok(outcome) => PromptOutcome::Completed {
-                        prompt_index: i,
-                        prompt,
-                        outcome,
-                    },
-                    Err(error) => PromptOutcome::Failed {
-                        prompt_index: i,
-                        prompt,
-                        error,
-                    },
-                }
-            } else {
-                PromptOutcome::Skipped {
-                    prompt_index: i,
-                    prompt,
-                    reason: SkipReason::NotSelectedByDiversification,
-                }
-            };
-
-            Some((outcome, s))
         }))
     }
 }
 
+/// Boxed-and-pinned in-flight prompt future. The future owns clones of
+/// `Arc<Vec<SlotTemplate>>` / `Arc<Vec<Arc<dyn JudgeProvider>>>` plus the
+/// moved-out prompt `String`, so it is `'static` and trivially poll-able
+/// inside [`FuturesUnordered`]. Not `Send` — the per-run stream stays
+/// single-task (the M5a orchestrator's future is also not `Send`).
+type PromptFuture = Pin<Box<dyn Future<Output = (usize, PromptOutcome)>>>;
+
 struct StreamState {
-    slot_templates: Vec<SlotTemplate>,
-    judges: Vec<Arc<dyn JudgeProvider>>,
+    slot_templates: Arc<Vec<SlotTemplate>>,
+    judges: Arc<Vec<Arc<dyn JudgeProvider>>>,
     prompts: Vec<String>,
     selected: HashSet<usize>,
-    next: usize,
+    next_to_schedule: usize,
+    next_to_emit: usize,
+    parallelism: usize,
+    in_flight: FuturesUnordered<PromptFuture>,
+    reorder_buffer: BTreeMap<usize, PromptOutcome>,
 }
 
 async fn process_prompt(
@@ -574,6 +678,11 @@ pub enum DatasetBuildError {
         slot_index: usize,
         model_label: String,
     },
+    /// `parallelism = 0` is rejected eagerly: zero in-flight prompts means
+    /// the stream could never schedule any work. `1` is the sequential
+    /// default; higher values enable bounded per-prompt concurrency.
+    #[error("dataset builder parallelism must be >= 1, got 0")]
+    ZeroParallelism,
 }
 
 /// Fatal one-shot runtime error returned by [`DatasetRun::execute`] before
@@ -1186,6 +1295,329 @@ mod tests {
             }
             other => panic!("expected EmbeddingDimensionMismatch, got {other:?}"),
         }
+    }
+
+    // ---------- M6b: bounded per-prompt parallelism ----------
+
+    #[test]
+    fn build_rejects_zero_parallelism() {
+        let client = OpenAiClient::new("k".to_string());
+        let result = DatasetBuilder::new(PanicEmbedder)
+            .slot(SlotTemplate::openai(client, "slot-a", 1, ok_openai_planner))
+            .judge(FnJudge {
+                label: "j".to_string(),
+                f: rank_in_order,
+            })
+            .parallelism(0)
+            .build();
+        assert!(matches!(result, Err(DatasetBuildError::ZeroParallelism)));
+    }
+
+    /// Three prompts, three samples in flight at once. The judge sleeps long
+    /// only when judging prompt 0's candidates (identified by the `R0`
+    /// content marker mockito returns), so prompt 0 finishes last in real
+    /// time. The stream must still emit the outcomes in original
+    /// `prompt_index` order: 0, 1, 2.
+    #[tokio::test]
+    async fn execute_preserves_index_order_when_later_prompts_finish_first() {
+        use std::time::Duration;
+
+        let mut server = mockito::Server::new_async().await;
+        let _m0 = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::Regex(r#""p0""#.to_string()))
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "R0"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+        let _m1 = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::Regex(r#""p1""#.to_string()))
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "R1"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+        let _m2 = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::Regex(r#""p2""#.to_string()))
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "R2"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+
+        let client = OpenAiClient::new_with_base_url("k".to_string(), server.url());
+
+        struct SleepJudge {
+            label: String,
+            slow_marker: String,
+            slow_delay: Duration,
+        }
+        impl JudgeProvider for SleepJudge {
+            fn label(&self) -> &str {
+                &self.label
+            }
+            fn invoke<'a>(
+                &'a self,
+                request: JudgeRequest,
+            ) -> BoxFuture<'a, Result<String, AgnosticCompletionError>> {
+                let marker = self.slow_marker.clone();
+                let slow_delay = self.slow_delay;
+                Box::pin(async move {
+                    let user = request.user_message;
+                    let delay = if user.contains(&marker) {
+                        slow_delay
+                    } else {
+                        Duration::from_millis(0)
+                    };
+                    tokio::time::sleep(delay).await;
+                    let n = user.matches("[c").count();
+                    let ids: Vec<String> = (1..=n).map(|i| format!("c{i}")).collect();
+                    Ok(format!(
+                        "<reasoning>r</reasoning><ranking>{}</ranking>",
+                        ids.join(",")
+                    ))
+                })
+            }
+        }
+
+        let run = DatasetBuilder::new(PanicEmbedder)
+            .slot(SlotTemplate::openai(client, "slot-a", 2, ok_openai_planner))
+            .judge(SleepJudge {
+                label: "j".to_string(),
+                slow_marker: "R0".to_string(),
+                slow_delay: Duration::from_millis(200),
+            })
+            .parallelism(3)
+            .build()
+            .expect("build");
+
+        let prompts = vec!["p0".to_string(), "p1".to_string(), "p2".to_string()];
+        let stream = run.execute(prompts).await.expect("execute");
+        let outcomes: Vec<PromptOutcome> = stream.collect().await;
+
+        assert_eq!(outcomes.len(), 3);
+        for (i, o) in outcomes.iter().enumerate() {
+            assert_eq!(
+                o.prompt_index(),
+                i,
+                "outcome at position {i} should carry prompt_index {i}"
+            );
+            assert!(
+                matches!(o, PromptOutcome::Completed { .. }),
+                "outcome at {i} should be Completed, got {o:?}"
+            );
+        }
+    }
+
+    /// Drives `parallelism=3` over six prompts and pins each judge call at a
+    /// shared [`tokio::sync::Barrier`] sized to `parallelism`. The barrier
+    /// only releases once exactly `parallelism` judge calls are concurrently
+    /// suspended, which is direct evidence that the dataset run keeps that
+    /// many — and no more — prompts in flight at once. A separate AtomicUsize
+    /// pair tracks the high-water mark and asserts equality with the cap.
+    /// An outer timeout guards against deadlocks: if scheduling ever kept
+    /// fewer than `parallelism` prompts in flight, the barrier would
+    /// deadlock and the test would fail with a clear message.
+    #[tokio::test]
+    async fn execute_respects_parallelism_cap_for_in_flight_prompts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let parallelism = 3;
+        let prompt_count = 6;
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let batch_barrier = Arc::new(tokio::sync::Barrier::new(parallelism));
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(prompt_count * 2)
+            .create_async()
+            .await;
+        let client = OpenAiClient::new_with_base_url("k".to_string(), server.url());
+
+        struct ConcurrencyJudge {
+            label: String,
+            active: Arc<AtomicUsize>,
+            max_seen: Arc<AtomicUsize>,
+            batch_barrier: Arc<tokio::sync::Barrier>,
+        }
+        impl JudgeProvider for ConcurrencyJudge {
+            fn label(&self) -> &str {
+                &self.label
+            }
+            fn invoke<'a>(
+                &'a self,
+                request: JudgeRequest,
+            ) -> BoxFuture<'a, Result<String, AgnosticCompletionError>> {
+                let active = self.active.clone();
+                let max_seen = self.max_seen.clone();
+                let barrier = self.batch_barrier.clone();
+                Box::pin(async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(now, Ordering::SeqCst);
+                    // Suspends until exactly `parallelism` judge calls reach
+                    // here — this is the test's central "concurrency really
+                    // happened, and was bounded" pivot.
+                    barrier.wait().await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    let n = request.user_message.matches("[c").count();
+                    let ids: Vec<String> = (1..=n).map(|i| format!("c{i}")).collect();
+                    Ok(format!(
+                        "<reasoning>r</reasoning><ranking>{}</ranking>",
+                        ids.join(",")
+                    ))
+                })
+            }
+        }
+
+        let judge = ConcurrencyJudge {
+            label: "j".to_string(),
+            active: active.clone(),
+            max_seen: max_seen.clone(),
+            batch_barrier,
+        };
+
+        let prompts: Vec<String> = (0..prompt_count).map(|i| format!("p{i}")).collect();
+
+        let run = DatasetBuilder::new(PanicEmbedder)
+            .slot(SlotTemplate::openai(client, "slot-a", 2, ok_openai_planner))
+            .judge(judge)
+            .parallelism(parallelism)
+            .build()
+            .expect("build");
+
+        let outcomes: Vec<PromptOutcome> = tokio::time::timeout(Duration::from_secs(10), async {
+            let stream = run.execute(prompts).await.expect("execute");
+            stream.collect::<Vec<PromptOutcome>>().await
+        })
+        .await
+        .expect("dataset run hung — concurrency cap likely violated and barrier deadlocked");
+
+        assert_eq!(outcomes.len(), prompt_count);
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            parallelism,
+            "max in-flight prompts must equal parallelism cap"
+        );
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "all judges should have released their active slot"
+        );
+        // And output order is preserved across the two batches.
+        for (i, o) in outcomes.iter().enumerate() {
+            assert_eq!(o.prompt_index(), i);
+            assert!(matches!(o, PromptOutcome::Completed { .. }));
+        }
+    }
+
+    /// Mixed success/failure under `parallelism > 1`: a failing planner on
+    /// odd-indexed prompts must produce [`PromptOutcome::Failed`] at those
+    /// positions without preventing later prompts from running. Mirrors the
+    /// M6a `failing_planner_yields_failed_then_continues_with_later_prompts`
+    /// test but under concurrent scheduling so the reorder buffer has to
+    /// interleave failed and completed outcomes correctly.
+    #[tokio::test]
+    async fn failing_planner_under_concurrency_does_not_stop_later_prompts() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }"#,
+            )
+            .expect_at_least(3) // 3 surviving prompts × 1 sample
+            .create_async()
+            .await;
+        let client = OpenAiClient::new_with_base_url("k".to_string(), server.url());
+
+        let plan = |prompt: &str| -> Result<OpenAiCompletionCommand, String> {
+            if prompt.contains("fail") {
+                Err(format!("planner says no for {prompt}"))
+            } else {
+                Ok(OpenAiCompletionCommand {
+                    model: OpenAiModel::Gpt4oMini,
+                    system_prompt: None,
+                    messages: vec![OpenAiMessage {
+                        role: OpenAiRole::User,
+                        content: prompt.to_string(),
+                    }],
+                    max_tokens: Some(8),
+                    temperature: None,
+                })
+            }
+        };
+
+        let run = DatasetBuilder::new(PanicEmbedder)
+            .slot(SlotTemplate::openai(client, "slot-a", 1, plan))
+            .judge(FnJudge {
+                label: "j".to_string(),
+                f: rank_in_order,
+            })
+            .parallelism(3)
+            .build()
+            .expect("build");
+
+        let prompts = vec![
+            "ok-0".to_string(),
+            "fail-1".to_string(),
+            "ok-2".to_string(),
+            "fail-3".to_string(),
+            "ok-4".to_string(),
+        ];
+
+        let stream = run.execute(prompts).await.expect("execute");
+        let outcomes: Vec<PromptOutcome> = stream.collect().await;
+
+        assert_eq!(outcomes.len(), 5);
+        for (i, o) in outcomes.iter().enumerate() {
+            assert_eq!(o.prompt_index(), i, "outcome at position {i}");
+        }
+        assert!(matches!(outcomes[0], PromptOutcome::Completed { .. }));
+        match &outcomes[1] {
+            PromptOutcome::Failed { error, prompt, .. } => {
+                assert_eq!(prompt, "fail-1");
+                let PromptRunError::SlotPlanning { source, .. } = error;
+                assert!(source.to_string().contains("planner says no for fail-1"));
+            }
+            other => panic!("expected Failed at index 1, got {other:?}"),
+        }
+        assert!(matches!(outcomes[2], PromptOutcome::Completed { .. }));
+        match &outcomes[3] {
+            PromptOutcome::Failed { prompt, .. } => assert_eq!(prompt, "fail-3"),
+            other => panic!("expected Failed at index 3, got {other:?}"),
+        }
+        assert!(matches!(outcomes[4], PromptOutcome::Completed { .. }));
     }
 
     #[tokio::test]
